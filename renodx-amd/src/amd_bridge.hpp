@@ -45,6 +45,15 @@ struct FrameResources {
   }
 };
 
+struct FrameState {
+  FrameResources resources;
+  std::optional<sl::Constants> constants;
+
+  [[nodiscard]] bool IsReadyForUpscale() const {
+    return resources.HasMinimumUpscaleInputs() && constants.has_value();
+  }
+};
+
 // Returns true when the backend consumed the feature call. When true, the
 // callback must write the result that RenoDX should return to the game.
 using EvaluateOverrideCallback = bool (*)(
@@ -53,13 +62,13 @@ using EvaluateOverrideCallback = bool (*)(
     const sl::BaseStructure** inputs,
     uint32_t num_inputs,
     sl::CommandBuffer* command_buffer,
-    const FrameResources& resources,
+    const FrameState& state,
     sl::Result* result);
 
 namespace internal {
 
-inline std::shared_mutex resources_mutex;
-inline FrameResources latest_resources;
+inline std::shared_mutex state_mutex;
+inline FrameState latest_state;
 inline std::atomic<EvaluateOverrideCallback> evaluate_override = nullptr;
 
 inline CapturedResource* FindResourceSlot(sl::BufferType type) {
@@ -67,21 +76,21 @@ inline CapturedResource* FindResourceSlot(sl::BufferType type) {
     case sl::kBufferTypeDepth:
     case sl::kBufferTypeHiResDepth:
     case sl::kBufferTypeLinearDepth:
-      return &latest_resources.depth;
+      return &latest_state.resources.depth;
     case sl::kBufferTypeMotionVectors:
-      return &latest_resources.motion_vectors;
+      return &latest_state.resources.motion_vectors;
     case sl::kBufferTypeScalingInputColor:
-      return &latest_resources.scaling_input;
+      return &latest_state.resources.scaling_input;
     case sl::kBufferTypeScalingOutputColor:
-      return &latest_resources.scaling_output;
+      return &latest_state.resources.scaling_output;
     case sl::kBufferTypeExposure:
-      return &latest_resources.exposure;
+      return &latest_state.resources.exposure;
     case sl::kBufferTypeReactiveMaskHint:
-      return &latest_resources.reactive_mask;
+      return &latest_state.resources.reactive_mask;
     case sl::kBufferTypeTransparencyAndCompositionMaskHint:
-      return &latest_resources.transparency_composition_mask;
+      return &latest_state.resources.transparency_composition_mask;
     case sl::kBufferTypeHUDLessColor:
-      return &latest_resources.hudless_color;
+      return &latest_state.resources.hudless_color;
     default:
       return nullptr;
   }
@@ -92,7 +101,7 @@ inline CapturedResource* FindResourceSlot(sl::BufferType type) {
 inline void CaptureTags(const sl::ResourceTag* tags, uint32_t num_tags) {
   if (tags == nullptr || num_tags == 0u) return;
 
-  std::unique_lock lock(internal::resources_mutex);
+  std::unique_lock lock(internal::state_mutex);
 
   for (uint32_t i = 0u; i < num_tags; ++i) {
     const auto& tag = tags[i];
@@ -110,21 +119,26 @@ inline void CaptureTags(const sl::ResourceTag* tags, uint32_t num_tags) {
   }
 }
 
-inline FrameResources SnapshotResources() {
-  std::shared_lock lock(internal::resources_mutex);
-  return internal::latest_resources;
+inline void CaptureConstants(const sl::Constants& values) {
+  std::unique_lock lock(internal::state_mutex);
+  internal::latest_state.constants = values;
 }
 
-inline void ResetResources() {
-  std::unique_lock lock(internal::resources_mutex);
-  internal::latest_resources = {};
+inline FrameState SnapshotState() {
+  std::shared_lock lock(internal::state_mutex);
+  return internal::latest_state;
+}
+
+inline void ResetState() {
+  std::unique_lock lock(internal::state_mutex);
+  internal::latest_state = {};
 }
 
 inline void SetEvaluateOverride(EvaluateOverrideCallback callback) {
   internal::evaluate_override.store(callback, std::memory_order_release);
 }
 
-[[nodiscard]] inline bool HasEvaluateOverride() {
+[[nodiscard]] inline bool IsBackendAvailable() {
   return internal::evaluate_override.load(std::memory_order_acquire) != nullptr;
 }
 
@@ -140,10 +154,10 @@ inline bool TryEvaluate(
   const auto callback = internal::evaluate_override.load(std::memory_order_acquire);
   if (callback == nullptr) return false;
 
-  const auto resources = SnapshotResources();
-  if (!resources.HasMinimumUpscaleInputs()) return false;
+  const auto state = SnapshotState();
+  if (!state.IsReadyForUpscale()) return false;
 
-  return callback(feature, frame, inputs, num_inputs, command_buffer, resources, result);
+  return callback(feature, frame, inputs, num_inputs, command_buffer, state, result);
 }
 
 }  // namespace renodx::utils::dlss::amd_bridge
