@@ -1,15 +1,23 @@
 From: RenoDX AMD bridge experiment
-Subject: [PATCH 1/2] dlss: expose Streamline DLSS resources to alternate backend
+Subject: [PATCH 1/2] dlss: expose Streamline DLSS input to alternate backend
 
 Target: clshortfuse/renodx@8d360960a8bdeccada1a1babf7f02215c15c82e8
 
 This patch is intentionally fail-open. If no alternate backend is registered,
-all calls continue through the existing Streamline path.
+all calls continue through the existing Streamline path. Feature support is
+only overridden when a backend has explicitly registered an evaluation
+callback.
 
 ---
  src/utils/dlss/amd_bridge.hpp    | new file (copy from renodx-amd/src/amd_bridge.hpp)
- src/utils/dlss/streamline_v2.hpp | 22 ++++++++++++++++++++++
- 2 files changed, 22 insertions(+)
+ src/utils/dlss/streamline_v2.hpp | integration changes described below
+
+The integration changes are:
+- capture Streamline resources after RenoDX clone redirection
+- capture Streamline common temporal constants
+- offer DLSS evaluation to an alternate backend before NVIDIA Streamline
+- report DLSS supported/loaded only while that backend is registered
+- otherwise preserve the original RenoDX/Streamline behavior
 
 diff --git a/src/utils/dlss/streamline_v2.hpp b/src/utils/dlss/streamline_v2.hpp
 index 17109dd..EXPERIMENT 100644
@@ -22,6 +30,31 @@ index 17109dd..EXPERIMENT 100644
  #include "./DXGIFactoryWrapper.hpp"
  #include "./DXGISwapChainWrapper.hpp"
 @@
++static decltype(&slIsFeatureSupported) Real_slIsFeatureSupported = nullptr;
++static sl::Result Hooked_slIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterInfo) {
++  if (feature == sl::kFeatureDLSS && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    return sl::Result::eOk;
++  }
++  return Real_slIsFeatureSupported(feature, adapterInfo);
++}
++
++static decltype(&slIsFeatureLoaded) Real_slIsFeatureLoaded = nullptr;
++static sl::Result Hooked_slIsFeatureLoaded(sl::Feature feature, bool& loaded) {
++  if (feature == sl::kFeatureDLSS && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    loaded = true;
++    return sl::Result::eOk;
++  }
++  return Real_slIsFeatureLoaded(feature, loaded);
++}
++
++static decltype(&slSetConstants) Real_slSetConstants = nullptr;
++static sl::Result Hooked_slSetConstants(const sl::Constants& values, const sl::FrameToken& frame, const sl::ViewportHandle& viewport) {
++  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    renodx::utils::dlss::amd_bridge::CaptureConstants(values);
++  }
++  return Real_slSetConstants(values, frame, viewport);
++}
++
  static decltype(&slEvaluateFeature) Real_slEvaluateFeature = nullptr;
  SL_API sl::Result Hooked_slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, const sl::BaseStructure** inputs, uint32_t numInputs, sl::CommandBuffer* cmdBuffer) {
    (void)frame;
@@ -42,33 +75,44 @@ index 17109dd..EXPERIMENT 100644
    return Real_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
  }
 @@
-   const bool unwrapped = utils::directx::NativeFromReShadeProxy(&cmdBuffer);
-   assert((unwrapped || cmdBuffer == nullptr) && "slSetTag expected a ReShade proxy command buffer.");
- 
    // return sl::Result::eOk;
    if (rewritten_resource_count == 0u) {
-+    renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
++    if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++      renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
++    }
      return Real_slSetTag(viewport, tags, numTags, cmdBuffer);
    }
    copy_tags_until(numTags);
  
-+  renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
++  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
++  }
    sl::Result result = Real_slSetTag(viewport, rewritten_tags.data(), numTags, cmdBuffer);
    return result;
  }
 @@
-   const bool unwrapped = utils::directx::NativeFromReShadeProxy(&cmdBuffer);
-   assert((unwrapped || cmdBuffer == nullptr) && "slSetTagForFrame expected a ReShade proxy command buffer.");
- 
    if (rewritten_resource_count == 0u) {
-+    renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
++    if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++      renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
++    }
      return Real_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
    }
    copy_tags_until(numTags);
  
-+  renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
++  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
++  }
    sl::Result result = Real_slSetTagForFrame(frame, viewport, rewritten_tags.data(), numTags, cmdBuffer);
    return result;
  }
+@@
+ static const std::vector<std::tuple<const char*, void**, void*>> INTERPOSER_HOOKS = {
+     {"slInit", reinterpret_cast<void**>(&Real_slInit), &Hooked_slInit},
++    {"slIsFeatureSupported", reinterpret_cast<void**>(&Real_slIsFeatureSupported), &Hooked_slIsFeatureSupported},
++    {"slIsFeatureLoaded", reinterpret_cast<void**>(&Real_slIsFeatureLoaded), &Hooked_slIsFeatureLoaded},
++    {"slSetConstants", reinterpret_cast<void**>(&Real_slSetConstants), &Hooked_slSetConstants},
+     {"slSetTag", reinterpret_cast<void**>(&Real_slSetTag), &Hooked_slSetTag},
+     {"slSetD3DDevice", reinterpret_cast<void**>(&Real_slSetD3DDevice), &Hooked_slSetD3DDevice},
+     {"slSetTagForFrame", reinterpret_cast<void**>(&Real_slSetTagForFrame), &Hooked_slSetTagForFrame},
 -- 
 2.0.0
