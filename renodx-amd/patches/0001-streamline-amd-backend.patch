@@ -1,0 +1,74 @@
+From: RenoDX AMD bridge experiment
+Subject: [PATCH 1/2] dlss: expose Streamline DLSS resources to alternate backend
+
+Target: clshortfuse/renodx@8d360960a8bdeccada1a1babf7f02215c15c82e8
+
+This patch is intentionally fail-open. If no alternate backend is registered,
+all calls continue through the existing Streamline path.
+
+---
+ src/utils/dlss/amd_bridge.hpp    | new file (copy from renodx-amd/src/amd_bridge.hpp)
+ src/utils/dlss/streamline_v2.hpp | 22 ++++++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/src/utils/dlss/streamline_v2.hpp b/src/utils/dlss/streamline_v2.hpp
+index 17109dd..EXPERIMENT 100644
+--- a/src/utils/dlss/streamline_v2.hpp
++++ b/src/utils/dlss/streamline_v2.hpp
+@@
+ #include "../platform.hpp"
+ #include "../resource.hpp"
++#include "./amd_bridge.hpp"
+ #include "./DXGIFactoryWrapper.hpp"
+ #include "./DXGISwapChainWrapper.hpp"
+@@
+ static decltype(&slEvaluateFeature) Real_slEvaluateFeature = nullptr;
+ SL_API sl::Result Hooked_slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, const sl::BaseStructure** inputs, uint32_t numInputs, sl::CommandBuffer* cmdBuffer) {
+   (void)frame;
+   const bool unwrapped = utils::directx::NativeFromReShadeProxy(&cmdBuffer);
+   assert((unwrapped || cmdBuffer == nullptr) && "slEvaluateFeature expected a ReShade proxy command buffer.");
++
++  sl::Result alternate_result = sl::Result::eOk;
++  if (renodx::utils::dlss::amd_bridge::TryEvaluate(
++          feature,
++          frame,
++          inputs,
++          numInputs,
++          cmdBuffer,
++          &alternate_result)) {
++    return alternate_result;
++  }
++
+   return Real_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+ }
+@@
+   const bool unwrapped = utils::directx::NativeFromReShadeProxy(&cmdBuffer);
+   assert((unwrapped || cmdBuffer == nullptr) && "slSetTag expected a ReShade proxy command buffer.");
+ 
+   // return sl::Result::eOk;
+   if (rewritten_resource_count == 0u) {
++    renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
+     return Real_slSetTag(viewport, tags, numTags, cmdBuffer);
+   }
+   copy_tags_until(numTags);
+ 
++  renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
+   sl::Result result = Real_slSetTag(viewport, rewritten_tags.data(), numTags, cmdBuffer);
+   return result;
+ }
+@@
+   const bool unwrapped = utils::directx::NativeFromReShadeProxy(&cmdBuffer);
+   assert((unwrapped || cmdBuffer == nullptr) && "slSetTagForFrame expected a ReShade proxy command buffer.");
+ 
+   if (rewritten_resource_count == 0u) {
++    renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
+     return Real_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
+   }
+   copy_tags_until(numTags);
+ 
++  renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
+   sl::Result result = Real_slSetTagForFrame(frame, viewport, rewritten_tags.data(), numTags, cmdBuffer);
+   return result;
+ }
+-- 
+2.0.0
