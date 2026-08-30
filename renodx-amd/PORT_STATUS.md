@@ -42,8 +42,10 @@ That makes the Streamline hook the correct translation boundary.
 
 `patches/0001-streamline-amd-backend.patch`
 
-- Calls the capture layer from both Streamline tag APIs.
+- Calls the capture layer from both Streamline tag APIs after clone redirection.
+- Hooks `slSetConstants` so the AMD backend receives temporal constants.
 - Calls the alternate backend before the real DLSS evaluation.
+- Conditionally reports DLSS supported/loaded only while an alternate backend is registered.
 - Does not change normal RenoDX behavior when the backend is absent.
 
 ## Still required before the port can render a frame
@@ -65,9 +67,11 @@ Build `ffxCreateContext` and `ffxDispatch` descriptors using AMD's official FSR 
 - transparency/composition mask -> transparency/composition mask when present
 - `sl::Constants` -> jitter, motion-vector scale, near/far/FOV, reset/camera-cut metadata
 
-### C. Feature exposure on AMD
+AMD's current 2026 API still exposes the small five-call ABI (`ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch`, `ffxQuery`, `ffxConfigure`), so this dynamic-loader design remains compatible with the current SDK rather than being tied to an older FSR3-only integration.
 
-Once (and only once) the FSR backend can successfully create a context, Streamline must conditionally report DLSS input support to the game. The safe version should cover `slInit`, `slIsFeatureSupported`, `slIsFeatureLoaded`, and any requirements/version query a game relies on. Do not report DLSS available merely because an AMD GPU is detected.
+### C. Streamline initialization exposure
+
+The patch now covers the common `slIsFeatureSupported` / `slIsFeatureLoaded` gates, but production integration should also filter/coordinate `slInit` feature loading when the AMD backend is active. That avoids asking the NVIDIA DLSS plugin to initialize on AMD before the replacement dispatch path takes ownership. Requirements/version queries should only be overridden when a real AMD context exists.
 
 ### D. Resource barriers / states
 
@@ -101,7 +105,7 @@ If an independently runnable DLSS 5 model/backend ever becomes legally and techn
 ## Validation gates
 
 1. Bridge compiles in RenoDX with backend disabled.
-2. NVIDIA regression: byte-for-byte behavior path remains fall-through.
+2. NVIDIA regression: behavior remains fall-through when no backend is registered.
 3. AMD backend loads only when required exports exist.
 4. DLSS feature is not spoofed until context creation succeeds.
 5. One fixed-resolution DX12 Streamline game renders correctly.
