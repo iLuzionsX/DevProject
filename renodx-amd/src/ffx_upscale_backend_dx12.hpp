@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <d3d12.h>
+#include <dxgi1_6.h>
 
 #if RENODX_AMD_HAS_FFX_API && __has_include(<ffx_upscale.h>) && __has_include(<dx12/ffx_api_dx12.h>)
 #include <ffx_upscale.h>
@@ -35,6 +36,8 @@
 #endif
 
 namespace renodx::utils::dlss::amd_bridge::ffx_dx12 {
+
+constexpr uint32_t kAmdVendorId = 0x1002u;
 
 enum class InputColorSpace {
   kLinear,
@@ -92,6 +95,23 @@ inline BackendConfig config{};
 inline bool initialized = false;
 inline std::unordered_map<uint32_t, ContextRecord> contexts;
 
+inline bool IsAmdDevice(ID3D12Device* candidate) {
+  if (candidate == nullptr) return false;
+
+  IDXGIFactory4* factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || factory == nullptr) return false;
+
+  IDXGIAdapter1* adapter = nullptr;
+  const auto result = factory->EnumAdapterByLuid(candidate->GetAdapterLuid(), IID_PPV_ARGS(&adapter));
+  factory->Release();
+  if (FAILED(result) || adapter == nullptr) return false;
+
+  DXGI_ADAPTER_DESC1 desc{};
+  const auto desc_result = adapter->GetDesc1(&desc);
+  adapter->Release();
+  return SUCCEEDED(desc_result) && desc.VendorId == kAmdVendorId;
+}
+
 inline ID3D12Resource* NativeResource(const CapturedResource& captured) {
   if (!captured.IsValid()) return nullptr;
   return reinterpret_cast<ID3D12Resource*>(captured.resource->native);
@@ -128,6 +148,31 @@ inline bool IsValidSlFloat(float value) {
   return std::isfinite(value) && value != sl::INVALID_FLOAT;
 }
 
+inline const sl::DLSSOptions* DlssOptions(const FrameState& state) {
+  return state.dlss_options.has_value() ? &*state.dlss_options : nullptr;
+}
+
+inline bool IsHdr(const FrameState& state) {
+  const auto* options = DlssOptions(state);
+  return config.high_dynamic_range
+      || (options != nullptr && options->colorBuffersHDR == sl::Boolean::eTrue);
+}
+
+inline bool UseAutoExposure(const FrameState& state) {
+  const auto* options = DlssOptions(state);
+  if (options != nullptr && options->useAutoExposure == sl::Boolean::eTrue) return true;
+  return !IsUsableOptionalResource(state.resources.exposure)
+      && config.auto_exposure_when_missing;
+}
+
+inline float EffectivePreExposure(const FrameState& state) {
+  const auto* options = DlssOptions(state);
+  if (options != nullptr && std::isfinite(options->preExposure) && options->preExposure > 0.0f) {
+    return options->preExposure;
+  }
+  return std::max(config.pre_exposure, 0.0001f);
+}
+
 inline float VerticalFov(const sl::Constants& constants) {
   if (config.fov_convention == FovConvention::kVertical) return constants.cameraFOV;
   if (!IsValidSlFloat(constants.cameraAspectRatio) || constants.cameraAspectRatio <= 0.0f) {
@@ -141,7 +186,7 @@ inline uint32_t BuildCreateFlags(const FrameState& state) {
   const auto& constants = *state.constants;
   uint32_t flags = 0u;
 
-  if (config.high_dynamic_range) flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
+  if (IsHdr(state)) flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
   if (config.dynamic_resolution) flags |= FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
   if (config.depth_infinite) flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
   if (constants.depthInverted == sl::Boolean::eTrue) flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
@@ -160,11 +205,7 @@ inline uint32_t BuildCreateFlags(const FrameState& state) {
     flags |= FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
   }
 
-  if (!IsUsableOptionalResource(state.resources.exposure)
-      && config.auto_exposure_when_missing) {
-    flags |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
-  }
-
+  if (UseAutoExposure(state)) flags |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
   return flags;
 }
 
@@ -186,9 +227,7 @@ inline sl::Result MapFfxResult(ffxReturnCode_t result) {
 inline void DestroyContextLocked(ContextRecord& record) {
   if (record.context == nullptr) return;
   const auto& runtime = ffx::GetRuntime();
-  if (runtime.destroy_context != nullptr) {
-    runtime.destroy_context(&record.context, nullptr);
-  }
+  if (runtime.destroy_context != nullptr) runtime.destroy_context(&record.context, nullptr);
   record = {};
 }
 
@@ -214,7 +253,6 @@ inline bool ProviderAvailableLocked() {
 
 inline bool CreateContextLocked(
     uint32_t viewport,
-    const FrameState& state,
     Dimensions render_size,
     Dimensions output_size,
     uint32_t create_flags) {
@@ -300,11 +338,9 @@ inline bool RequiredResourcesReady(const FrameState& state) {
     return false;
   }
 
-  if (!IsUsableOptionalResource(resources.exposure)
-      && !config.auto_exposure_when_missing) {
-    return false;
-  }
-
+  const auto* options = DlssOptions(state);
+  if (options != nullptr && options->mode == sl::DLSSMode::eOff) return false;
+  if (!IsUsableOptionalResource(resources.exposure) && !UseAutoExposure(state)) return false;
   return true;
 }
 
@@ -349,9 +385,7 @@ inline void RestoreResourceStates(
 }
 
 inline FfxApiResource ReadResource(const CapturedResource& captured) {
-  return ffxApiGetResourceDX12(
-      NativeResource(captured),
-      FFX_API_RESOURCE_STATE_COMPUTE_READ);
+  return ffxApiGetResourceDX12(NativeResource(captured), FFX_API_RESOURCE_STATE_COMPUTE_READ);
 }
 
 inline FfxApiResource OptionalReadResource(const CapturedResource& captured) {
@@ -364,6 +398,24 @@ inline FfxApiResource OutputResource(const CapturedResource& captured) {
       NativeResource(captured),
       FFX_API_RESOURCE_STATE_UNORDERED_ACCESS,
       FFX_API_RESOURCE_USAGE_UAV);
+}
+
+inline std::optional<uint32_t> QualityMode(sl::DLSSMode mode) {
+  switch (mode) {
+    case sl::DLSSMode::eDLAA:
+      return FFX_UPSCALE_QUALITY_MODE_NATIVEAA;
+    case sl::DLSSMode::eMaxQuality:
+    case sl::DLSSMode::eUltraQuality:
+      return FFX_UPSCALE_QUALITY_MODE_QUALITY;
+    case sl::DLSSMode::eBalanced:
+      return FFX_UPSCALE_QUALITY_MODE_BALANCED;
+    case sl::DLSSMode::eMaxPerformance:
+      return FFX_UPSCALE_QUALITY_MODE_PERFORMANCE;
+    case sl::DLSSMode::eUltraPerformance:
+      return FFX_UPSCALE_QUALITY_MODE_ULTRA_PERFORMANCE;
+    default:
+      return std::nullopt;
+  }
 }
 
 inline bool BridgePreflight(
@@ -382,7 +434,7 @@ inline bool BridgePreflight(
   const auto render_size = ResourceDimensions(state.resources.scaling_input);
   const auto output_size = ResourceDimensions(state.resources.scaling_output);
   const auto flags = BuildCreateFlags(state);
-  return CreateContextLocked(state.viewport, state, render_size, output_size, flags);
+  return CreateContextLocked(state.viewport, render_size, output_size, flags);
 }
 
 inline sl::Result BridgeEvaluate(
@@ -420,20 +472,10 @@ inline sl::Result BridgeEvaluate(
   TransitionResource(command_list, resources.scaling_input, kReadState, restore);
   TransitionResource(command_list, resources.depth, kReadState, restore);
   TransitionResource(command_list, resources.motion_vectors, kReadState, restore);
-  if (IsUsableOptionalResource(resources.exposure)) {
-    TransitionResource(command_list, resources.exposure, kReadState, restore);
-  }
-  if (IsUsableOptionalResource(resources.reactive_mask)) {
-    TransitionResource(command_list, resources.reactive_mask, kReadState, restore);
-  }
-  if (IsUsableOptionalResource(resources.transparency_composition_mask)) {
-    TransitionResource(command_list, resources.transparency_composition_mask, kReadState, restore);
-  }
-  TransitionResource(
-      command_list,
-      resources.scaling_output,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      restore);
+  if (IsUsableOptionalResource(resources.exposure)) TransitionResource(command_list, resources.exposure, kReadState, restore);
+  if (IsUsableOptionalResource(resources.reactive_mask)) TransitionResource(command_list, resources.reactive_mask, kReadState, restore);
+  if (IsUsableOptionalResource(resources.transparency_composition_mask)) TransitionResource(command_list, resources.transparency_composition_mask, kReadState, restore);
+  TransitionResource(command_list, resources.scaling_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, restore);
 
   ffxDispatchDescUpscale dispatch{};
   dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -441,7 +483,7 @@ inline sl::Result BridgeEvaluate(
   dispatch.color = ReadResource(resources.scaling_input);
   dispatch.depth = ReadResource(resources.depth);
   dispatch.motionVectors = ReadResource(resources.motion_vectors);
-  dispatch.exposure = OptionalReadResource(resources.exposure);
+  dispatch.exposure = UseAutoExposure(state) ? FfxApiResource{} : OptionalReadResource(resources.exposure);
   dispatch.reactive = OptionalReadResource(resources.reactive_mask);
   dispatch.transparencyAndComposition = OptionalReadResource(resources.transparency_composition_mask);
   dispatch.output = OutputResource(resources.scaling_output);
@@ -459,7 +501,7 @@ inline sl::Result BridgeEvaluate(
   dispatch.enableSharpening = config.enable_sharpening;
   dispatch.sharpness = std::clamp(config.sharpness, 0.0f, 1.0f);
   dispatch.frameTimeDelta = std::max(config.frame_time_delta_ms, 0.001f);
-  dispatch.preExposure = std::max(config.pre_exposure, 0.0001f);
+  dispatch.preExposure = EffectivePreExposure(state);
   dispatch.reset = constants.reset == sl::Boolean::eTrue;
   dispatch.cameraNear = constants.cameraNear;
   dispatch.cameraFar = constants.cameraFar;
@@ -472,11 +514,8 @@ inline sl::Result BridgeEvaluate(
     dispatch.flags |= FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ;
   }
 
-  const auto ffx_result = runtime.dispatch(
-      &record_it->second.context,
-      &dispatch.header);
+  const auto ffx_result = runtime.dispatch(&record_it->second.context, &dispatch.header);
 
-  // Order writes before handing the resource back to the game.
   D3D12_RESOURCE_BARRIER uav_barrier{};
   uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   uav_barrier.UAV.pResource = NativeResource(resources.scaling_output);
@@ -495,7 +534,7 @@ inline bool Initialize(
   SetBackendReady(false);
   SetBackendCallbacks(nullptr, nullptr);
 
-  if (device == nullptr || !ffx::Load(runtime_directory)) return false;
+  if (device == nullptr || !internal::IsAmdDevice(device) || !ffx::Load(runtime_directory)) return false;
 
   std::scoped_lock lock(internal::backend_mutex);
   internal::DestroyAllContextsLocked();
@@ -536,8 +575,64 @@ inline void Shutdown() {
 inline void UpdateConfig(const BackendConfig& config) {
   std::scoped_lock lock(internal::backend_mutex);
   internal::config = config;
-  // Context creation flags can change with configuration; rebuild lazily.
   internal::DestroyAllContextsLocked();
+}
+
+inline sl::Result SetDlssOptions(
+    const sl::ViewportHandle& viewport,
+    const sl::DLSSOptions& options) {
+  CaptureDlssOptions(viewport, options);
+  std::scoped_lock lock(internal::backend_mutex);
+  const auto it = internal::contexts.find(static_cast<uint32_t>(viewport));
+  if (it != internal::contexts.end()) internal::DestroyContextLocked(it->second);
+  return internal::initialized ? sl::Result::eOk : sl::Result::eErrorNotInitialized;
+}
+
+inline sl::Result GetOptimalSettings(
+    const sl::DLSSOptions& options,
+    sl::DLSSOptimalSettings& settings) {
+  if (options.outputWidth == sl::INVALID_UINT || options.outputHeight == sl::INVALID_UINT) {
+    return sl::Result::eErrorMissingInputParameter;
+  }
+
+  const auto quality = internal::QualityMode(options.mode);
+  if (!quality.has_value()) return sl::Result::eErrorInvalidParameter;
+
+  std::scoped_lock lock(internal::backend_mutex);
+  if (!internal::initialized || !ffx::GetRuntime().IsReady()) return sl::Result::eErrorNotInitialized;
+
+  uint32_t render_width = 0u;
+  uint32_t render_height = 0u;
+  ffxQueryDescUpscaleGetRenderResolutionFromQualityMode query{};
+  query.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE;
+  query.displayWidth = options.outputWidth;
+  query.displayHeight = options.outputHeight;
+  query.qualityMode = *quality;
+  query.pOutRenderWidth = &render_width;
+  query.pOutRenderHeight = &render_height;
+
+  const auto result = ffx::GetRuntime().query(nullptr, &query.header);
+  if (result != FFX_API_RETURN_OK || render_width == 0u || render_height == 0u) {
+    return internal::MapFfxResult(result);
+  }
+
+  settings.optimalRenderWidth = render_width;
+  settings.optimalRenderHeight = render_height;
+  settings.optimalSharpness = 0.0f;
+  // PoC compatibility: use an exact recommended range until provider-specific
+  // dynamic-resolution limits are queried and mapped.
+  settings.renderWidthMin = render_width;
+  settings.renderHeightMin = render_height;
+  settings.renderWidthMax = render_width;
+  settings.renderHeightMax = render_height;
+  return sl::Result::eOk;
+}
+
+inline sl::Result GetState(const sl::ViewportHandle&, sl::DLSSState& state) {
+  std::scoped_lock lock(internal::backend_mutex);
+  if (!internal::initialized) return sl::Result::eErrorNotInitialized;
+  state.estimatedVRAMUsageInBytes = 0u;
+  return sl::Result::eOk;
 }
 
 [[nodiscard]] inline bool IsInitialized() {
@@ -547,11 +642,12 @@ inline void UpdateConfig(const BackendConfig& config) {
 
 #else
 
-inline bool Initialize(ID3D12Device*, const BackendConfig& = {}, const std::filesystem::path& = L".") {
-  return false;
-}
+inline bool Initialize(ID3D12Device*, const BackendConfig& = {}, const std::filesystem::path& = L".") { return false; }
 inline void Shutdown() {}
 inline void UpdateConfig(const BackendConfig&) {}
+inline sl::Result SetDlssOptions(const sl::ViewportHandle&, const sl::DLSSOptions&) { return sl::Result::eErrorFeatureNotSupported; }
+inline sl::Result GetOptimalSettings(const sl::DLSSOptions&, sl::DLSSOptimalSettings&) { return sl::Result::eErrorFeatureNotSupported; }
+inline sl::Result GetState(const sl::ViewportHandle&, sl::DLSSState&) { return sl::Result::eErrorFeatureNotSupported; }
 [[nodiscard]] inline bool IsInitialized() { return false; }
 
 #endif  // RENODX_AMD_HAS_FFX_UPSCALE_DX12
