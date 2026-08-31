@@ -1,38 +1,51 @@
 From: RenoDX AMD bridge experiment
-Subject: [PATCH 1/2] dlss: expose Streamline DLSS input to alternate backend
+Subject: [PATCH 1/2] dlss: route Streamline DLSS input to FidelityFX on AMD
 
-Target: clshortfuse/renodx@8d360960a8bdeccada1a1babf7f02215c15c82e8
+Target baseline: clshortfuse/renodx@8d360960a8bdeccada1a1babf7f02215c15c82e8
+Reviewed against current streamline_v2.hpp layout as of 2026-08-31.
 
-This patch is intentionally fail-open. If no alternate backend is registered,
-all calls continue through the existing Streamline path. Feature support is
-only overridden when a backend has explicitly registered an evaluation
-callback.
+This patch is intentionally fail-open. NVIDIA systems keep the existing RenoDX
+Streamline path. The alternate backend only reports DLSS support after the AMD
+DX12 device and a FidelityFX upscaler provider have both been validated.
 
----
- src/utils/dlss/amd_bridge.hpp    | new file (copy from renodx-amd/src/amd_bridge.hpp)
- src/utils/dlss/streamline_v2.hpp | integration changes described below
+New files to copy into src/utils/dlss/:
+- amd_bridge.hpp
+- ffx_runtime_loader.hpp
+- ffx_upscale_backend_dx12.hpp
 
-The integration changes are:
-- capture Streamline resources after RenoDX clone redirection
-- capture Streamline common temporal constants
-- offer DLSS evaluation to an alternate backend before NVIDIA Streamline
-- report DLSS supported/loaded only while that backend is registered
-- otherwise preserve the original RenoDX/Streamline behavior
+The Streamline integration changes below:
+- initialize FidelityFX from the native D3D12 device after slSetD3DDevice
+- keep AMD state scoped by frame token + viewport
+- capture tags after RenoDX clone redirection
+- capture common constants and DLSS options
+- virtualize the three DLSS feature functions needed by typical integrations
+- offer DLSS evaluation to FidelityFX before NVIDIA Streamline
+- only fall through before AMD GPU work has started
+- shut the AMD backend down before Streamline shutdown
 
-diff --git a/src/utils/dlss/streamline_v2.hpp b/src/utils/dlss/streamline_v2.hpp
-index 17109dd..EXPERIMENT 100644
 --- a/src/utils/dlss/streamline_v2.hpp
 +++ b/src/utils/dlss/streamline_v2.hpp
 @@
  #include "../platform.hpp"
  #include "../resource.hpp"
 +#include "./amd_bridge.hpp"
++#include "./ffx_upscale_backend_dx12.hpp"
  #include "./DXGIFactoryWrapper.hpp"
  #include "./DXGISwapChainWrapper.hpp"
 @@
+ static decltype(&slInit) Real_slInit = nullptr;
++static decltype(&slShutdown) Real_slShutdown = nullptr;
+ static decltype(&slGetNativeInterface) Real_slGetNativeInterface = nullptr;
+@@
++SL_API sl::Result Hooked_slShutdown() {
++  renodx::utils::dlss::amd_bridge::ffx_dx12::Shutdown();
++  return Real_slShutdown();
++}
++
 +static decltype(&slIsFeatureSupported) Real_slIsFeatureSupported = nullptr;
 +static sl::Result Hooked_slIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterInfo) {
-+  if (feature == sl::kFeatureDLSS && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++  if (feature == sl::kFeatureDLSS
++      && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
 +    return sl::Result::eOk;
 +  }
 +  return Real_slIsFeatureSupported(feature, adapterInfo);
@@ -40,7 +53,8 @@ index 17109dd..EXPERIMENT 100644
 +
 +static decltype(&slIsFeatureLoaded) Real_slIsFeatureLoaded = nullptr;
 +static sl::Result Hooked_slIsFeatureLoaded(sl::Feature feature, bool& loaded) {
-+  if (feature == sl::kFeatureDLSS && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++  if (feature == sl::kFeatureDLSS
++      && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
 +    loaded = true;
 +    return sl::Result::eOk;
 +  }
@@ -48,16 +62,19 @@ index 17109dd..EXPERIMENT 100644
 +}
 +
 +static decltype(&slSetConstants) Real_slSetConstants = nullptr;
-+static sl::Result Hooked_slSetConstants(const sl::Constants& values, const sl::FrameToken& frame, const sl::ViewportHandle& viewport) {
++static sl::Result Hooked_slSetConstants(
++    const sl::Constants& values,
++    const sl::FrameToken& frame,
++    const sl::ViewportHandle& viewport) {
 +  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
-+    renodx::utils::dlss::amd_bridge::CaptureConstants(values);
++    renodx::utils::dlss::amd_bridge::CaptureConstants(values, frame, viewport);
 +  }
 +  return Real_slSetConstants(values, frame, viewport);
 +}
-+
+@@
  static decltype(&slEvaluateFeature) Real_slEvaluateFeature = nullptr;
  SL_API sl::Result Hooked_slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, const sl::BaseStructure** inputs, uint32_t numInputs, sl::CommandBuffer* cmdBuffer) {
-   (void)frame;
+-  (void)frame;
    const bool unwrapped = utils::directx::NativeFromReShadeProxy(&cmdBuffer);
    assert((unwrapped || cmdBuffer == nullptr) && "slEvaluateFeature expected a ReShade proxy command buffer.");
 +
@@ -69,38 +86,147 @@ index 17109dd..EXPERIMENT 100644
 +          numInputs,
 +          cmdBuffer,
 +          &alternate_result)) {
++    // Important: TryEvaluate only returns true after the AMD preflight has
++    // transferred ownership. Never call NVIDIA Streamline after this point.
 +    return alternate_result;
 +  }
 +
    return Real_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
  }
 @@
-   // return sl::Result::eOk;
+ extern "C" decltype(&slDLSSSetOptions) Real_slDLSSSetOptions = nullptr;
+ extern "C" sl::Result Hooked_slDLSSSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSOptions& options) {
++  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    return renodx::utils::dlss::amd_bridge::ffx_dx12::SetDlssOptions(viewport, options);
++  }
++
++  if (Real_slDLSSSetOptions == nullptr) return sl::Result::eErrorFeatureNotSupported;
+   sl::DLSSOptions options_copy = options;
+   options_copy.colorBuffersHDR = sl::Boolean::eTrue;
+   options_copy.useAutoExposure = sl::Boolean::eTrue;
+ 
+   return Real_slDLSSSetOptions(viewport, options_copy);
+ }
++
++extern "C" decltype(&slDLSSGetOptimalSettings) Real_slDLSSGetOptimalSettings = nullptr;
++extern "C" sl::Result Hooked_slDLSSGetOptimalSettings(
++    const sl::DLSSOptions& options,
++    sl::DLSSOptimalSettings& settings) {
++  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    return renodx::utils::dlss::amd_bridge::ffx_dx12::GetOptimalSettings(options, settings);
++  }
++  if (Real_slDLSSGetOptimalSettings == nullptr) return sl::Result::eErrorFeatureNotSupported;
++  return Real_slDLSSGetOptimalSettings(options, settings);
++}
++
++extern "C" decltype(&slDLSSGetState) Real_slDLSSGetState = nullptr;
++extern "C" sl::Result Hooked_slDLSSGetState(
++    const sl::ViewportHandle& viewport,
++    sl::DLSSState& state) {
++  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    return renodx::utils::dlss::amd_bridge::ffx_dx12::GetState(viewport, state);
++  }
++  if (Real_slDLSSGetState == nullptr) return sl::Result::eErrorFeatureNotSupported;
++  return Real_slDLSSGetState(viewport, state);
++}
+@@
+ static decltype(&slSetD3DDevice) Real_slSetD3DDevice = nullptr;
+ static sl::Result Hooked_slSetD3DDevice(void* d3dDevice) {
+   auto* native_device = static_cast<IUnknown*>(d3dDevice);
+   renodx::utils::directx::NativeFromReShadeProxy(&native_device);
+ 
+   auto* d3d12_device = static_cast<ID3D12Device*>(native_device);
+   auto ret = Real_slSetD3DDevice(native_device);
+@@
+     return ret;
+   }
++
++  // Initialize is AMD-vendor-gated and provider-gated internally. A false
++  // return leaves the existing NVIDIA path completely unchanged.
++  renodx::utils::dlss::amd_bridge::ffx_dx12::Initialize(d3d12_device);
+ 
+   return ret;
+ }
+@@
+ static decltype(&slGetFeatureFunction) Real_slGetFeatureFunction = nullptr;
+ SL_API sl::Result Hooked_slGetFeatureFunction(sl::Feature feature, const char* functionName, void*& function) {
++  // Return stable wrappers for the DLSS API surface even when the NVIDIA DLSS
++  // plugin cannot provide these symbols on AMD. If NVIDIA does provide them,
++  // preserve the real pointer so the wrapper can fall through normally.
++  if (feature == sl::kFeatureDLSS) {
++    if (std::strcmp(functionName, "slDLSSSetOptions") == 0) {
++      void* real_function = nullptr;
++      const auto real_ret = Real_slGetFeatureFunction(feature, functionName, real_function);
++      if (real_ret == sl::Result::eOk) {
++        Real_slDLSSSetOptions = reinterpret_cast<decltype(&slDLSSSetOptions)>(real_function);
++      }
++      function = reinterpret_cast<void*>(&Hooked_slDLSSSetOptions);
++      return sl::Result::eOk;
++    }
++    if (std::strcmp(functionName, "slDLSSGetOptimalSettings") == 0) {
++      void* real_function = nullptr;
++      const auto real_ret = Real_slGetFeatureFunction(feature, functionName, real_function);
++      if (real_ret == sl::Result::eOk) {
++        Real_slDLSSGetOptimalSettings = reinterpret_cast<decltype(&slDLSSGetOptimalSettings)>(real_function);
++      }
++      function = reinterpret_cast<void*>(&Hooked_slDLSSGetOptimalSettings);
++      return sl::Result::eOk;
++    }
++    if (std::strcmp(functionName, "slDLSSGetState") == 0) {
++      void* real_function = nullptr;
++      const auto real_ret = Real_slGetFeatureFunction(feature, functionName, real_function);
++      if (real_ret == sl::Result::eOk) {
++        Real_slDLSSGetState = reinterpret_cast<decltype(&slDLSSGetState)>(real_function);
++      }
++      function = reinterpret_cast<void*>(&Hooked_slDLSSGetState);
++      return sl::Result::eOk;
++    }
++  }
++
+   const auto ret = Real_slGetFeatureFunction(feature, functionName, function);
+   if (ret != sl::Result::eOk) {
+     return ret;
+   }
+@@
+-    case sl::kFeatureDLSS:
+-      if (std::strcmp(functionName, "slDLSSSetOptions") == 0) {
+-        Real_slDLSSSetOptions = reinterpret_cast<decltype(&slDLSSSetOptions)>(function);
+-        function = (void*)&Hooked_slDLSSSetOptions;
+-        return sl::Result::eOk;
+-      }
+-      break;
++    case sl::kFeatureDLSS:
++      break;
+@@
+ static sl::Result Hooked_slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer) {
+@@
    if (rewritten_resource_count == 0u) {
 +    if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
-+      renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
++      renodx::utils::dlss::amd_bridge::CaptureTags(viewport, tags, numTags);
 +    }
      return Real_slSetTag(viewport, tags, numTags, cmdBuffer);
    }
    copy_tags_until(numTags);
  
 +  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
-+    renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
++    renodx::utils::dlss::amd_bridge::CaptureTags(viewport, rewritten_tags.data(), numTags);
 +  }
    sl::Result result = Real_slSetTag(viewport, rewritten_tags.data(), numTags, cmdBuffer);
    return result;
  }
 @@
+ static sl::Result Hooked_slSetTagForFrame(const sl::FrameToken& frame, const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer) {
+@@
    if (rewritten_resource_count == 0u) {
 +    if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
-+      renodx::utils::dlss::amd_bridge::CaptureTags(tags, numTags);
++      renodx::utils::dlss::amd_bridge::CaptureTags(frame, viewport, tags, numTags);
 +    }
      return Real_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
    }
    copy_tags_until(numTags);
  
 +  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
-+    renodx::utils::dlss::amd_bridge::CaptureTags(rewritten_tags.data(), numTags);
++    renodx::utils::dlss::amd_bridge::CaptureTags(frame, viewport, rewritten_tags.data(), numTags);
 +  }
    sl::Result result = Real_slSetTagForFrame(frame, viewport, rewritten_tags.data(), numTags, cmdBuffer);
    return result;
@@ -108,11 +234,28 @@ index 17109dd..EXPERIMENT 100644
 @@
  static const std::vector<std::tuple<const char*, void**, void*>> INTERPOSER_HOOKS = {
      {"slInit", reinterpret_cast<void**>(&Real_slInit), &Hooked_slInit},
++    {"slShutdown", reinterpret_cast<void**>(&Real_slShutdown), &Hooked_slShutdown},
 +    {"slIsFeatureSupported", reinterpret_cast<void**>(&Real_slIsFeatureSupported), &Hooked_slIsFeatureSupported},
 +    {"slIsFeatureLoaded", reinterpret_cast<void**>(&Real_slIsFeatureLoaded), &Hooked_slIsFeatureLoaded},
 +    {"slSetConstants", reinterpret_cast<void**>(&Real_slSetConstants), &Hooked_slSetConstants},
      {"slSetTag", reinterpret_cast<void**>(&Real_slSetTag), &Hooked_slSetTag},
      {"slSetD3DDevice", reinterpret_cast<void**>(&Real_slSetD3DDevice), &Hooked_slSetD3DDevice},
      {"slSetTagForFrame", reinterpret_cast<void**>(&Real_slSetTagForFrame), &Hooked_slSetTagForFrame},
+@@
+ };
+
+Known PoC limitations intentionally NOT hidden by this patch:
+- slIsFeatureSupported called before slSetD3DDevice cannot yet validate the AMD
+  provider and therefore still falls through to Streamline.
+- slGetFeatureRequirements/version virtualization is not implemented yet.
+- slInit feature filtering is not implemented; some titles may reject AMD before
+  the device hook if they require the NVIDIA DLSS plugin during initialization.
+- frame-time delta is currently a backend configuration default until RenoDX
+  supplies measured per-frame timing.
+- non-zero Streamline resource-subrect offsets fail preflight rather than dispatch
+  against the wrong pixels.
+- the source files require the official FidelityFX SDK headers and runtime DLLs;
+  see BUILD_INTEGRATION.md.
+
 -- 
 2.0.0
