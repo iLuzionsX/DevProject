@@ -2,115 +2,193 @@
 
 ## Goal
 
-Use RenoDX's existing DirectX/Streamline interception to make a game's DLSS temporal inputs consumable by a non-NVIDIA backend on AMD hardware.
+Use RenoDX's existing DirectX/Streamline interception to make a game's DLSS temporal-upscaling path consumable by AMD's FidelityFX upscaler API.
 
-## What is already proven by the upstream code
+This is **DLSS API/input compatibility**, not an attempt to execute NVIDIA's proprietary DLSS model on AMD hardware.
 
-RenoDX's current Streamline v2 hook already intercepts:
+## Upstream seam
 
-- `slSetTag` and `slSetTagForFrame`
+RenoDX's Streamline v2 hook already intercepts the right boundary:
+
+- `slSetTag` / `slSetTagForFrame`
+- `slSetConstants`
 - `slEvaluateFeature`
 - `slGetFeatureFunction`
-- D3D12 device / command-list / queue wrapping
+- native D3D12 device / command-list handling
+- resource clone redirection
 
-Its tag hook sees the exact resource classes needed by temporal upscalers, including depth, motion vectors, scaling input/output, exposure, reactive mask and transparency/composition mask. It also rewrites tags when RenoDX has upgraded/cloned a resource.
-
-That makes the Streamline hook the correct translation boundary.
+That means the game has already supplied most of the temporal information an alternate upscaler needs before RenoDX decides which backend consumes it.
 
 ## Implemented on this branch
 
-### 1. Backend-neutral capture/handoff
+### 1. Frame/viewport-scoped bridge
 
 `src/amd_bridge.hpp`
 
-- Captures the final Streamline resources by value after any RenoDX resource redirection.
-- Captures `sl::Constants` for temporal data needed by FSR (jitter, motion-vector scale, camera/reset data, etc.).
-- Requires depth + motion vectors + input + output + constants before attempting an override.
-- Exposes `SetEvaluateOverride()` so an AMD backend can consume `sl::kFeatureDLSS`.
-- Falls through to the original Streamline path when no backend is registered.
+The original global latest-frame scaffold has been replaced.
 
-### 2. AMD FSR runtime loader
+Current behavior:
+
+- keyed by Streamline frame index + viewport;
+- legacy viewport-scoped state for deprecated `slSetTag`;
+- bounded state retention;
+- captures depth, motion vectors, scaling input/output, exposure, reactive mask, transparency/composition mask, and HUD-less color;
+- captures `sl::Constants` per frame/viewport;
+- captures `sl::DLSSOptions` per viewport;
+- walks local `slEvaluateFeature` structure chains and overlays local resource tags/constants/options;
+- refuses an ambiguous evaluate call rather than mixing two viewports;
+- separates backend readiness from callback registration;
+- has a preflight/evaluate ownership split so the bridge can fall through to NVIDIA only before AMD GPU commands are recorded.
+
+### 2. Typed FidelityFX loader
 
 `src/ffx_runtime_loader.hpp`
 
-- Loads `amd_fidelityfx_loader_dx12.dll` first (FSR SDK 2.x).
-- Falls back to the legacy combined `amd_fidelityfx_dx12.dll`.
-- Verifies the five FSR API exports: `ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch`, `ffxQuery`, `ffxConfigure`.
-- Does not copy or freeze AMD ABI descriptor definitions; the real dispatcher should compile against AMD's official `ffx_api` headers.
+- dynamically loads `amd_fidelityfx_loader_dx12.dll`;
+- legacy combined-DLL filename fallback remains for older layouts;
+- uses official `PfnFfx*` types when `ffx_api.h` is available;
+- validates the five public FidelityFX API exports:
+  - `ffxCreateContext`
+  - `ffxDestroyContext`
+  - `ffxDispatch`
+  - `ffxQuery`
+  - `ffxConfigure`
 
-### 3. RenoDX integration patch
+### 3. Concrete FidelityFX DX12 backend
+
+`src/ffx_upscale_backend_dx12.hpp`
+
+Implemented source path:
+
+- accepts only a device whose DXGI adapter vendor ID is AMD (`0x1002`);
+- validates an upscaler provider with `ffxQueryDescGetVersions` before marking the alternate backend ready;
+- creates one FFX upscaler context per Streamline viewport;
+- current SDK context chain is:
+  - `ffxCreateContextDescUpscale`
+  - `ffxCreateContextDescUpscaleVersion` using `FFX_UPSCALER_VERSION`
+  - `ffxCreateBackendDX12Desc`
+- chooses the installed FidelityFX provider rather than hard-coding one GPU generation;
+- recreates a context when required dimensions or creation flags change;
+- uses `ffxApiGetResourceDX12` for D3D12 resources;
+- maps required Streamline inputs to FFX color/output/depth/MV;
+- maps optional exposure/reactive/composition resources;
+- maps jitter, reset, depth inversion, jittered MVs, near/far planes and FOV;
+- converts Streamline's normalized motion-vector scale to FFX pixel-space scale using the render dimensions;
+- uses viewport DLSS options for HDR, auto exposure and pre-exposure;
+- maps DLAA/Quality/Balanced/Performance/Ultra Performance to AMD quality-mode queries;
+- supplies AMD-backed `DLSSOptimalSettings` for the provider-recommended render resolution;
+- records D3D12 transitions to compute-read/UAV, an output UAV barrier, and restores the original Streamline-provided resource states;
+- maps FFX return codes back to Streamline result codes.
+
+### 4. RenoDX hook integration patch
 
 `patches/0001-streamline-amd-backend.patch`
 
-- Calls the capture layer from both Streamline tag APIs after clone redirection.
-- Hooks `slSetConstants` so the AMD backend receives temporal constants.
-- Calls the alternate backend before the real DLSS evaluation.
-- Conditionally reports DLSS supported/loaded only while an alternate backend is registered.
-- Does not change normal RenoDX behavior when the backend is absent.
+The patch kit now describes:
 
-## Still required before the port can render a frame
+- AMD backend initialization after RenoDX unwraps the native `ID3D12Device` in `slSetD3DDevice`;
+- provider-gated `slIsFeatureSupported` / `slIsFeatureLoaded` virtualization;
+- frame/viewport-aware `slSetConstants` capture;
+- resource capture after RenoDX clone redirection in both tag APIs;
+- AMD evaluation before the NVIDIA Streamline evaluation;
+- stable wrappers for `slDLSSSetOptions`, `slDLSSGetOptimalSettings`, and `slDLSSGetState` even when the NVIDIA DLSS plugin cannot return those symbols on AMD;
+- backend shutdown before Streamline shutdown.
 
-### A. Frame/viewport-scoped state
+### 5. Reproducible integration notes
 
-The first scaffold keeps the latest state globally. Production code must key captures by viewport and, for frame-based tagging, frame token so multiple viewports / frames in flight cannot cross-contaminate resources.
+`BUILD_INTEGRATION.md`
 
-### B. FSR descriptor mapping
+Documents the source-copy steps, official FidelityFX include paths, expected loader/provider DLL layout, resource-state behavior, known PoC limits, and validation order.
 
-Build `ffxCreateContext` and `ffxDispatch` descriptors using AMD's official FSR API headers. Map:
+## FidelityFX inputs currently mapped
 
-- Streamline scaling input -> FSR color input
-- Streamline scaling output -> FSR output
-- depth -> FSR depth
-- motion vectors -> FSR motion vectors
-- exposure -> exposure when present
-- reactive mask -> reactive mask when present
-- transparency/composition mask -> transparency/composition mask when present
-- `sl::Constants` -> jitter, motion-vector scale, near/far/FOV, reset/camera-cut metadata
+### Resources
 
-AMD's current 2026 API still exposes the small five-call ABI (`ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch`, `ffxQuery`, `ffxConfigure`), so this dynamic-loader design remains compatible with the current SDK rather than being tied to an older FSR3-only integration.
+- scaling input color -> FFX color
+- scaling output color -> FFX output
+- depth / hi-res depth / linear depth -> FFX depth
+- motion vectors -> FFX motion vectors
+- exposure -> optional FFX exposure
+- reactive mask hint -> optional FFX reactive
+- transparency/composition mask hint -> optional FFX transparency/composition
 
-### C. Streamline initialization exposure
+### Streamline constants
 
-The patch now covers the common `slIsFeatureSupported` / `slIsFeatureLoaded` gates, but production integration should also filter/coordinate `slInit` feature loading when the AMD backend is active. That avoids asking the NVIDIA DLSS plugin to initialize on AMD before the replacement dispatch path takes ownership. Requirements/version queries should only be overridden when a real AMD context exists.
+- jitter -> jitter offset
+- `mvecScale * render dimensions` -> FFX motion-vector scale
+- reset -> reset/camera cut
+- near/far -> camera near/far
+- FOV -> vertical FOV, with configurable convention
+- depth inverted -> FFX create flag
+- jittered MVs -> FFX jitter-cancellation flag
 
-### D. Resource barriers / states
+### DLSS options
 
-FSR dispatch must transition all D3D12 resources to the states required by the AMD API and restore/hand back states expected by the game. RenoDX already tracks resource state information, which should be reused rather than creating a parallel tracker.
+- `preExposure` -> FFX pre-exposure
+- `colorBuffersHDR` -> HDR create flag
+- `useAutoExposure` -> FFX auto-exposure path
+- DLSS mode -> FFX quality-mode query
 
-### E. Lifecycle
+`DLSSOptions.exposureScale` is **not** mapped yet.
 
-Create/destroy FSR contexts on:
+## What is no longer just a plan
 
-- device init/destroy
-- render-size changes
-- output-size changes
-- swapchain recreation
-- relevant HDR/format changes
+The branch now contains a real source-level `ffxCreateContext` + `ffxDispatch` path and D3D12 resource-state handling. The previous major architectural gaps—global frame state, generic callback only, untyped runtime entry points, and missing context/dispatch mapping—have been implemented in source.
 
-### F. Hardware-specific backend choice
+## What is still not proven
 
-The translation layer should not assume FSR4 everywhere. Backend selection should be capability-driven:
+This staging repository does not itself build RenoDX, so the new code is **not yet compile-validated or game-validated**.
 
-- FSR4/FSR4.1 where the installed AMD runtime/GPU supports it
-- FSR3.1 fallback for older AMD GPUs
+Do not call it a working release binary until the next gates pass.
 
-That preserves the main objective—DLSS game inputs on AMD—even when the newest FSR model is unavailable.
+## Current blockers / hardening work
 
-## Important distinction: DLSS 5 vs DLSS input compatibility
+### Build/package integration
 
-The RTX 40-series unlock work can reuse NVIDIA's own NGX/Streamline implementation because the GPU is still NVIDIA. On AMD, RenoDX cannot simply call the proprietary NVIDIA DLSS implementation and expect it to execute. The engineering target here is therefore API/input compatibility: make a game that only exposes DLSS feed those temporal inputs into an AMD-capable neural/upscaling backend.
+- apply the patch to a real RenoDX worktree/fork;
+- add FidelityFX SDK include paths;
+- package `amd_fidelityfx_loader_dx12.dll` plus an upscaler provider DLL;
+- compile against the exact RenoDX + current FidelityFX header versions.
 
-If an independently runnable DLSS 5 model/backend ever becomes legally and technically available, the callback boundary in this experiment is intentionally generic enough to host that instead of FSR.
+### Streamline exposure edge cases
+
+- a title that asks `slIsFeatureSupported` before `slSetD3DDevice` can still reject DLSS before an AMD provider can safely be validated;
+- `slGetFeatureRequirements` and feature-version virtualization are not implemented;
+- `slInit` still allows normal Streamline feature loading; titles that insist on initializing NVIDIA's DLSS plugin before device setup may require feature filtering or a deeper interposer layer.
+
+### Frame/render correctness
+
+- per-frame delta still defaults to 16.67 ms instead of being measured from RenoDX/game timing;
+- non-zero Streamline resource subrect offsets currently fail preflight;
+- FOV convention and infinite-far-plane behavior require runtime validation;
+- provider-specific dynamic-resolution min/max settings are not exposed yet;
+- optional resource requirements should be queried/validated across FSR4 and legacy providers;
+- resource-state restoration must be checked against RenoDX clone-state tracking in live games.
+
+### Compatibility
+
+- test provider selection on FSR 4.x-capable AMD hardware;
+- test an older AMD path where the loader selects a legacy upscaler provider;
+- verify no-backend/NVIDIA behavior remains unchanged;
+- test multiple frames in flight and multiple viewports;
+- test HDR, camera cuts, resize, alt-tab, and dynamic resolution;
+- test at least two unrelated Streamline titles.
 
 ## Validation gates
 
-1. Bridge compiles in RenoDX with backend disabled.
-2. NVIDIA regression: behavior remains fall-through when no backend is registered.
-3. AMD backend loads only when required exports exist.
-4. DLSS feature is not spoofed until context creation succeeds.
-5. One fixed-resolution DX12 Streamline game renders correctly.
-6. Dynamic resolution + resize.
-7. Camera cuts / reset.
-8. HDR formats.
-9. Multiple frames in flight.
-10. At least two unrelated games before calling the bridge generic.
+1. Compile RenoDX with the bridge sources present and AMD runtime absent.
+2. Confirm NVIDIA/no-backend fallthrough remains intact.
+3. Compile with current FidelityFX SDK headers.
+4. Validate AMD vendor and provider gating.
+5. Validate the first FFX context creation.
+6. Record the first successful FFX upscale dispatch in a fixed-resolution title.
+7. Validate camera cuts/reset and resource-state restoration.
+8. Validate resize/dynamic resolution/HDR.
+9. Validate multiple frames in flight and multiple viewports.
+10. Validate a second unrelated game before calling the bridge generic.
+
+## DLSS 5 distinction
+
+An RTX 40-series unlock can still call NVIDIA's own NGX/DLSS runtime because the hardware remains NVIDIA. This AMD experiment is different: it translates a game's DLSS-facing temporal input path into an AMD-capable backend.
+
+If an independently runnable, legally distributable DLSS model/backend ever exists, the bridge's backend boundary could host it. Nothing in this branch claims that such a runtime exists today.
