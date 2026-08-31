@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -55,6 +56,7 @@ struct FrameState {
   uint32_t viewport = std::numeric_limits<uint32_t>::max();
   FrameResources resources;
   std::optional<sl::Constants> constants;
+  std::optional<sl::DLSSOptions> dlss_options;
 
   [[nodiscard]] bool IsReadyForUpscale() const {
     return resources.HasMinimumUpscaleInputs() && constants.has_value();
@@ -219,12 +221,11 @@ inline void ApplyLocalInputStructures(
     const sl::BaseStructure* current = inputs[i];
     while (current != nullptr) {
       if (current->structType == sl::ResourceTag::s_structType) {
-        ApplyTags(
-            state.resources,
-            reinterpret_cast<const sl::ResourceTag*>(current),
-            1u);
+        ApplyTags(state.resources, reinterpret_cast<const sl::ResourceTag*>(current), 1u);
       } else if (current->structType == sl::Constants::s_structType) {
         state.constants = *reinterpret_cast<const sl::Constants*>(current);
+      } else if (current->structType == sl::DLSSOptions::s_structType) {
+        state.dlss_options = *reinterpret_cast<const sl::DLSSOptions*>(current);
       }
       current = current->next;
     }
@@ -250,12 +251,15 @@ inline std::optional<FrameState> SnapshotForEvaluation(
     const auto exact = states.find(FrameKey{frame_index, *viewport});
     if (exact != states.end()) state = exact->second.state;
 
-    // Legacy slSetTag resources are viewport-scoped but not frame-scoped.
+    // Legacy slSetTag and DLSS options are viewport-scoped but not frame-scoped.
     const auto legacy = states.find(FrameKey{kLegacyFrameIndex, *viewport});
     if (legacy != states.end()) {
       MergeMissingResources(state.resources, legacy->second.state.resources);
       if (!state.constants.has_value() && legacy->second.state.constants.has_value()) {
         state.constants = legacy->second.state.constants;
+      }
+      if (!state.dlss_options.has_value() && legacy->second.state.dlss_options.has_value()) {
+        state.dlss_options = legacy->second.state.dlss_options;
       }
     }
 
@@ -276,6 +280,18 @@ inline std::optional<FrameState> SnapshotForEvaluation(
 
   lock.unlock();
   if (!unique.has_value()) return std::nullopt;
+
+  // Merge the viewport's persistent options/tags if an exact frame candidate
+  // gave us the viewport but not the persistent values.
+  {
+    std::shared_lock fallback_lock(state_mutex);
+    const auto legacy = states.find(FrameKey{kLegacyFrameIndex, unique->viewport});
+    if (legacy != states.end()) {
+      MergeMissingResources(unique->resources, legacy->second.state.resources);
+      if (!unique->dlss_options.has_value()) unique->dlss_options = legacy->second.state.dlss_options;
+    }
+  }
+
   ApplyLocalInputStructures(*unique, inputs, num_inputs);
   return unique;
 }
@@ -319,6 +335,16 @@ inline void CaptureConstants(
       static_cast<uint32_t>(frame),
       static_cast<uint32_t>(viewport)});
   stored.state.constants = values;
+  internal::PruneLocked();
+}
+
+inline void CaptureDlssOptions(
+    const sl::ViewportHandle& viewport,
+    const sl::DLSSOptions& options) {
+  std::unique_lock lock(internal::state_mutex);
+  auto& stored = internal::TouchLocked(
+      internal::FrameKey{kLegacyFrameIndex, static_cast<uint32_t>(viewport)});
+  stored.state.dlss_options = options;
   internal::PruneLocked();
 }
 
