@@ -1,9 +1,10 @@
 /*
- * Experimental runtime loader for AMD FSR API DX12 binaries.
+ * Experimental runtime loader for AMD FidelityFX API DX12 binaries.
  *
- * This intentionally does not reproduce AMD SDK ABI structs. The dispatch
- * implementation should include the official ffx_api headers and cast these
- * exports to the SDK function-pointer types there.
+ * When the official FidelityFX SDK headers are on the include path this loader
+ * exposes strongly typed ffxCreateContext/ffxDestroyContext/ffxDispatch/
+ * ffxQuery/ffxConfigure entry points. The bridge itself does not vendor AMD's
+ * ABI declarations.
  */
 
 #pragma once
@@ -11,18 +12,43 @@
 #include <array>
 #include <filesystem>
 #include <string_view>
+#include <type_traits>
 
 #include <Windows.h>
 
+#if __has_include(<ffx_api.h>)
+#include <ffx_api.h>
+#define RENODX_AMD_HAS_FFX_API 1
+#elif __has_include("ffx_api.h")
+#include "ffx_api.h"
+#define RENODX_AMD_HAS_FFX_API 1
+#else
+#define RENODX_AMD_HAS_FFX_API 0
+#endif
+
 namespace renodx::utils::dlss::amd_bridge::ffx {
+
+#if RENODX_AMD_HAS_FFX_API
+using CreateContextFn = PfnFfxCreateContext;
+using DestroyContextFn = PfnFfxDestroyContext;
+using DispatchFn = PfnFfxDispatch;
+using QueryFn = PfnFfxQuery;
+using ConfigureFn = PfnFfxConfigure;
+#else
+using CreateContextFn = FARPROC;
+using DestroyContextFn = FARPROC;
+using DispatchFn = FARPROC;
+using QueryFn = FARPROC;
+using ConfigureFn = FARPROC;
+#endif
 
 struct Runtime {
   HMODULE module = nullptr;
-  FARPROC create_context = nullptr;
-  FARPROC destroy_context = nullptr;
-  FARPROC dispatch = nullptr;
-  FARPROC query = nullptr;
-  FARPROC configure = nullptr;
+  CreateContextFn create_context = nullptr;
+  DestroyContextFn destroy_context = nullptr;
+  DispatchFn dispatch = nullptr;
+  QueryFn query = nullptr;
+  ConfigureFn configure = nullptr;
 
   [[nodiscard]] bool IsReady() const {
     return module != nullptr
@@ -36,7 +62,13 @@ struct Runtime {
 
 namespace internal {
 inline Runtime runtime;
+
+template <typename T>
+inline T LoadProc(HMODULE module, const char* name) {
+  static_assert(std::is_pointer_v<T>);
+  return reinterpret_cast<T>(GetProcAddress(module, name));
 }
+}  // namespace internal
 
 inline void Unload() {
   if (internal::runtime.module != nullptr) {
@@ -51,11 +83,11 @@ inline bool TryLoadModule(const std::filesystem::path& path) {
 
   Runtime candidate;
   candidate.module = module;
-  candidate.create_context = GetProcAddress(module, "ffxCreateContext");
-  candidate.destroy_context = GetProcAddress(module, "ffxDestroyContext");
-  candidate.dispatch = GetProcAddress(module, "ffxDispatch");
-  candidate.query = GetProcAddress(module, "ffxQuery");
-  candidate.configure = GetProcAddress(module, "ffxConfigure");
+  candidate.create_context = internal::LoadProc<CreateContextFn>(module, "ffxCreateContext");
+  candidate.destroy_context = internal::LoadProc<DestroyContextFn>(module, "ffxDestroyContext");
+  candidate.dispatch = internal::LoadProc<DispatchFn>(module, "ffxDispatch");
+  candidate.query = internal::LoadProc<QueryFn>(module, "ffxQuery");
+  candidate.configure = internal::LoadProc<ConfigureFn>(module, "ffxConfigure");
 
   if (!candidate.IsReady()) {
     FreeLibrary(module);
@@ -70,8 +102,8 @@ inline bool TryLoadModule(const std::filesystem::path& path) {
 inline bool Load(const std::filesystem::path& directory = L".") {
   if (internal::runtime.IsReady()) return true;
 
-  // FSR SDK 2.x split the loader and upscaler DLLs. The loader remains ABI
-  // compatible with the previous combined DX12 DLL, so prefer it first.
+  // Prefer the current FidelityFX API loader. The legacy combined DX12 name
+  // remains a fallback for older SDK/runtime layouts used by existing mods.
   constexpr std::array<std::wstring_view, 2> candidates = {
       L"amd_fidelityfx_loader_dx12.dll",
       L"amd_fidelityfx_dx12.dll",
