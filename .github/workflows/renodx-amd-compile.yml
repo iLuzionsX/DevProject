@@ -126,6 +126,10 @@ jobs:
         working-directory: renodx
         run: cmake --preset clang-x64 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
+      - name: Build dlssfix integration target
+        working-directory: renodx
+        run: cmake --build --preset clang-x64-release --target dlssfix --verbose
+
       - name: Build RenoDX x64
         working-directory: renodx
         run: cmake --build --preset clang-x64-release --verbose
