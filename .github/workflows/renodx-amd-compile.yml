@@ -54,8 +54,10 @@ jobs:
             "bridge/renodx-amd/src/amd_bridge.hpp",
             "bridge/renodx-amd/src/ffx_runtime_loader.hpp",
             "bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp",
+            "bridge/renodx-amd/src/ffx_support_probe_dx12.hpp",
             "bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
             "bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
+            "bridge/renodx-amd/patches/0003-early-support-probe.patch",
             "fidelityfx/Kits/FidelityFX/api/include/ffx_api.h",
             "fidelityfx/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
             "fidelityfx/Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h"
@@ -70,10 +72,12 @@ jobs:
           Copy-Item bridge/renodx-amd/src/amd_bridge.hpp renodx/src/utils/dlss/amd_bridge.hpp
           Copy-Item bridge/renodx-amd/src/ffx_runtime_loader.hpp renodx/src/utils/dlss/ffx_runtime_loader.hpp
           Copy-Item bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp renodx/src/utils/dlss/ffx_upscale_backend_dx12.hpp
+          Copy-Item bridge/renodx-amd/src/ffx_support_probe_dx12.hpp renodx/src/utils/dlss/ffx_support_probe_dx12.hpp
 
           $patches = @(
             "../bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
-            "../bridge/renodx-amd/patches/0002-motion-vector-domain.patch"
+            "../bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
+            "../bridge/renodx-amd/patches/0003-early-support-probe.patch"
           )
           foreach ($patch in $patches) {
             git -C renodx apply --check $patch
