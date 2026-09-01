@@ -93,6 +93,15 @@ int main() {
   assert(completion_route.motion.needs_camera_reprojection);
   assert(!completion_route.motion.needs_optical_flow);
 
+  UniversalFrame jittered_incomplete_native = incomplete_native;
+  jittered_incomplete_native.motion.contains_jitter = true;
+  const auto jittered_completion_route = PlanRoute(jittered_incomplete_native, backend);
+  assert(jittered_completion_route.eligible);
+  assert(jittered_completion_route.tier == InputTier::kCameraReconstructible);
+  assert(jittered_completion_route.motion.source == MotionSource::kCameraReprojection);
+  assert(!jittered_completion_route.motion.needs_native_motion);
+  assert(jittered_completion_route.motion.needs_camera_reprojection);
+
   UniversalFrame reset_completion = incomplete_native;
   reset_completion.timing.reset = true;
   const auto reset_completion_route = PlanRoute(reset_completion, backend);
