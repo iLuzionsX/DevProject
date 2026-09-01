@@ -61,6 +61,7 @@ int main() {
   assert(native_route.eligible);
   assert(native_route.tier == InputTier::kNativeTemporal);
   assert(native_route.motion.source == MotionSource::kNative);
+  assert(native_route.motion.needs_native_motion);
   assert(native_route.use_auto_exposure);
 
   UniversalFrame camera = native;
@@ -77,8 +78,25 @@ int main() {
   const auto camera_route = PlanRoute(camera, backend);
   assert(camera_route.eligible);
   assert(camera_route.tier == InputTier::kCameraReconstructible);
+  assert(!camera_route.motion.needs_native_motion);
   assert(camera_route.motion.needs_camera_reprojection);
   assert(!camera_route.motion.needs_optical_flow);
+
+  UniversalFrame incomplete_native = camera;
+  incomplete_native.motion_vectors = MakeResource(ResourceSemantic::kMotionVectors);
+  incomplete_native.motion.camera_motion = CameraMotionCoverage::kMissing;
+  const auto completion_route = PlanRoute(incomplete_native, backend);
+  assert(completion_route.eligible);
+  assert(completion_route.tier == InputTier::kNativeCameraCompletion);
+  assert(completion_route.motion.source == MotionSource::kNativeWithCameraReprojection);
+  assert(completion_route.motion.needs_native_motion);
+  assert(completion_route.motion.needs_camera_reprojection);
+  assert(!completion_route.motion.needs_optical_flow);
+
+  UniversalFrame reset_completion = incomplete_native;
+  reset_completion.timing.reset = true;
+  const auto reset_completion_route = PlanRoute(reset_completion, backend);
+  assert(!reset_completion_route.eligible);
 
   UniversalFrame reset_camera = camera;
   reset_camera.timing.reset = true;
