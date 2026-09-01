@@ -7,11 +7,6 @@ on:
     paths:
       - "renodx-amd/**"
       - ".github/workflows/renodx-amd-compile.yml"
-  push:
-    branches: [main]
-    paths:
-      - "renodx-amd/**"
-      - ".github/workflows/renodx-amd-compile.yml"
 
 concurrency:
   group: renodx-amd-${{ github.event.pull_request.number || github.ref }}
@@ -52,11 +47,6 @@ jobs:
           ref: ${{ env.FFX_REF }}
           path: fidelityfx
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Verify pins and source files
         shell: pwsh
         run: |
@@ -69,20 +59,12 @@ jobs:
             "bridge/renodx-amd/src/ffx_runtime_loader.hpp",
             "bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp",
             "bridge/renodx-amd/src/ffx_support_probe_dx12.hpp",
-            "bridge/renodx-amd/src/universal/universal_frame.hpp",
-            "bridge/renodx-amd/src/universal/backend.hpp",
-            "bridge/renodx-amd/src/universal/camera_motion_dx12.hpp",
-            "bridge/renodx-amd/src/universal/capture.hpp",
-            "bridge/renodx-amd/src/universal/discovery.hpp",
-            "bridge/renodx-amd/src/universal/reconstruction.hpp",
-            "bridge/renodx-amd/src/universal/routing.hpp",
-            "bridge/renodx-amd/src/universal/streamline_frame_adapter.hpp",
-            "bridge/renodx-amd/shaders/camera_motion_cs.hlsl",
-            "bridge/renodx-amd/tests/universal_core_smoke.cpp",
-            "bridge/renodx-amd/tests/camera_motion_dx12_smoke.cpp",
-            "bridge/renodx-amd/scripts/materialize_integration.py",
-            "bridge/renodx-amd/scripts/harden_streamline_contract.py",
-            "bridge/renodx-amd/scripts/wire_universal_core.py",
+            "bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
+            "bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
+            "bridge/renodx-amd/patches/0003-early-support-probe.patch",
+            "bridge/renodx-amd/patches/0004-resource-lifecycle.patch",
+            "bridge/renodx-amd/patches/0005-frame-time-delta.patch",
+            "bridge/renodx-amd/patches/0006-early-dlss-options.patch",
             "fidelityfx/Kits/FidelityFX/api/include/ffx_api.h",
             "fidelityfx/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
             "fidelityfx/Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h"
@@ -91,45 +73,40 @@ jobs:
             if (-not (Test-Path $path)) { throw "Missing required path: $path" }
           }
 
-      - name: Materialize bridge into RenoDX worktree
+      - name: Stage bridge into RenoDX worktree
         shell: pwsh
         run: |
-          python bridge/renodx-amd/scripts/materialize_integration.py `
-            --bridge-root bridge/renodx-amd `
-            --renodx-root renodx
-          if ($LASTEXITCODE -ne 0) { throw "Bridge materialization failed" }
+          Copy-Item bridge/renodx-amd/src/amd_bridge.hpp renodx/src/utils/dlss/amd_bridge.hpp
+          Copy-Item bridge/renodx-amd/src/ffx_runtime_loader.hpp renodx/src/utils/dlss/ffx_runtime_loader.hpp
+          Copy-Item bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp renodx/src/utils/dlss/ffx_upscale_backend_dx12.hpp
+          Copy-Item bridge/renodx-amd/src/ffx_support_probe_dx12.hpp renodx/src/utils/dlss/ffx_support_probe_dx12.hpp
 
-          python bridge/renodx-amd/scripts/wire_universal_core.py `
-            --bridge-root bridge/renodx-amd `
-            --renodx-root renodx
-          if ($LASTEXITCODE -ne 0) { throw "Universal core wiring failed" }
-
-          python bridge/renodx-amd/scripts/harden_streamline_contract.py `
-            --renodx-root renodx
-          if ($LASTEXITCODE -ne 0) { throw "Streamline contract hardening failed" }
+          $patches = @(
+            "../bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
+            "../bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
+            "../bridge/renodx-amd/patches/0003-early-support-probe.patch",
+            "../bridge/renodx-amd/patches/0004-resource-lifecycle.patch",
+            "../bridge/renodx-amd/patches/0005-frame-time-delta.patch",
+            "../bridge/renodx-amd/patches/0006-early-dlss-options.patch"
+          )
+          foreach ($patch in $patches) {
+            git -C renodx apply --check $patch
+            if ($LASTEXITCODE -ne 0) { throw "Patch check failed: $patch" }
+            git -C renodx apply $patch
+            if ($LASTEXITCODE -ne 0) { throw "Patch apply failed: $patch" }
+          }
 
           git -C renodx diff --check
           if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
           git -C renodx status --short
 
       - name: Set up sccache
-        id: sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Set up shader tools
         shell: pwsh
         working-directory: renodx
         run: .\scripts\setup-dev-env.ps1 -Update -Tools dxc,slang,glslang
-
-      - name: Compile camera-motion reconstruction shader
-        shell: pwsh
-        run: |
-          $dxc = Join-Path $env:GITHUB_WORKSPACE "renodx/bin/dxc.exe"
-          if (-not (Test-Path $dxc)) { throw "DXC not found at $dxc" }
-          & $dxc -T cs_6_0 -E main -WX `
-            -Fo camera_motion_cs.dxil `
-            bridge/renodx-amd/shaders/camera_motion_cs.hlsl
-          if ($LASTEXITCODE -ne 0) { throw "Camera motion shader compile failed" }
 
       - name: Set up Clang
         uses: egor-tensin/setup-clang@v1
@@ -141,29 +118,6 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: amd64
-
-      - name: Compile universal core smoke test
-        shell: pwsh
-        run: |
-          clang-cl /nologo /std:c++20 /EHsc /W4 /WX `
-            /I bridge/renodx-amd/src `
-            bridge/renodx-amd/tests/universal_core_smoke.cpp `
-            /Fe:universal_core_smoke.exe
-          if ($LASTEXITCODE -ne 0) { throw "Universal core compile failed" }
-          .\universal_core_smoke.exe
-          if ($LASTEXITCODE -ne 0) { throw "Universal core smoke test failed" }
-
-      - name: Execute camera-motion shader on D3D12 WARP
-        shell: pwsh
-        run: |
-          clang-cl /nologo /std:c++20 /EHsc /W4 /WX `
-            /I bridge/renodx-amd/src `
-            bridge/renodx-amd/tests/camera_motion_dx12_smoke.cpp `
-            /Fe:camera_motion_dx12_smoke.exe `
-            /link d3d12.lib dxgi.lib
-          if ($LASTEXITCODE -ne 0) { throw "Camera-motion WARP smoke compile failed" }
-          .\camera_motion_dx12_smoke.exe .\camera_motion_cs.dxil
-          if ($LASTEXITCODE -ne 0) { throw "Camera-motion WARP smoke test failed" }
 
       - name: Add FidelityFX headers to compiler include path
         shell: pwsh
@@ -180,31 +134,6 @@ jobs:
         working-directory: renodx
         run: cmake --build --preset clang-x64-release --target dlssfix --verbose
 
-      - name: Create hardware-test manifest
-        shell: pwsh
-        run: |
-          @"
-          bridge_sha=${{ github.sha }}
-          renodx_sha=$env:RENODX_SHA
-          fidelityfx_ref=$env:FFX_REF
-          universal_frame=1
-          camera_motion_shader=cs_6_0
-          camera_motion_runtime=dx12
-          camera_motion_warp_smoke=1
-          camera_motion_descriptors=immutable
-          "@ | Set-Content -Path hardware-test-manifest.txt -Encoding utf8
-
-      - name: Upload hardware-test bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: renodx-universal-dx12-${{ github.sha }}
-          if-no-files-found: error
-          path: |
-            renodx/build/Release/renodx-dlssfix.addon64
-            renodx/build/Release/renodx-dlssfix.pdb
-            camera_motion_cs.dxil
-            hardware-test-manifest.txt
-
       - name: Build RenoDX x64
         working-directory: renodx
         run: cmake --build --preset clang-x64-release --verbose
@@ -215,5 +144,5 @@ jobs:
         run: git -C renodx diff --stat
 
       - name: Show sccache stats
-        if: always() && steps.sccache.outcome == 'success'
+        if: always()
         run: sccache --show-stats
