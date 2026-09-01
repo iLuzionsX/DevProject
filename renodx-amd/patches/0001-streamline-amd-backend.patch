@@ -14,7 +14,7 @@ New files to copy into src/utils/dlss/:
 - ffx_upscale_backend_dx12.hpp
 
 The Streamline integration changes below:
-- initialize FidelityFX from the native D3D12 device after slSetD3DDevice
+- initialize FidelityFX from a queried native D3D12 device after slSetD3DDevice
 - keep AMD state scoped by frame token + viewport
 - capture tags after RenoDX clone redirection
 - capture common constants and DLSS options
@@ -135,15 +135,31 @@ The Streamline integration changes below:
    auto* native_device = static_cast<IUnknown*>(d3dDevice);
    renodx::utils::directx::NativeFromReShadeProxy(&native_device);
  
-   auto* d3d12_device = static_cast<ID3D12Device*>(native_device);
+-  auto* d3d12_device = static_cast<ID3D12Device*>(native_device);
++  // Streamline accepts D3D11 or D3D12 here. Never reinterpret a D3D11 device
++  // as ID3D12Device; only enable the FidelityFX path after a real QI succeeds.
++  ID3D12Device* d3d12_device = nullptr;
++  if (native_device != nullptr) {
++    native_device->QueryInterface(IID_PPV_ARGS(&d3d12_device));
++  }
    auto ret = Real_slSetD3DDevice(native_device);
 @@
-     return ret;
+-    return ret;
++    if (d3d12_device != nullptr) d3d12_device->Release();
++    return ret;
    }
 +
-+  // Initialize is AMD-vendor-gated and provider-gated internally. A false
-+  // return leaves the existing NVIDIA path completely unchanged.
-+  renodx::utils::dlss::amd_bridge::ffx_dx12::Initialize(d3d12_device);
++  // Initialize is AMD-vendor-gated and provider-gated internally. A null
++  // d3d12_device means this was a D3D11 integration and the AMD DX12 backend
++  // intentionally stays disabled.
++  if (d3d12_device != nullptr) {
++    renodx::utils::dlss::amd_bridge::ffx_dx12::Initialize(d3d12_device);
++    d3d12_device->Release();
++  }
+-
+-  // Initialize is AMD-vendor-gated and provider-gated internally. A false
+-  // return leaves the existing NVIDIA path completely unchanged.
+-  renodx::utils::dlss::amd_bridge::ffx_dx12::Initialize(d3d12_device);
  
    return ret;
  }
