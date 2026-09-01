@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -23,10 +24,11 @@ struct MotionTarget {
 };
 
 // Shader-visible descriptors cannot be rewritten while an in-flight command
-// list may still reference them. Keep each depth/motion descriptor pair
-// immutable for its lifetime and cache new pairs when resources rotate.
+// list may still reference them. Keep each descriptor set immutable for its
+// lifetime and cache a new set when any resource rotates.
 struct DescriptorSet {
   ID3D12DescriptorHeap* heap = nullptr;
+  ID3D12Resource* native_motion = nullptr;
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* motion = nullptr;
 };
@@ -35,9 +37,12 @@ struct ShaderConstants {
   float current_to_previous_clip[16]{};
   uint32_t render_width = 0u;
   uint32_t render_height = 0u;
-  uint32_t padding[2]{};
+  float native_motion_scale_x = 1.0f;
+  float native_motion_scale_y = 1.0f;
+  uint32_t use_native_motion = 0u;
+  uint32_t padding[3]{};
 };
-static_assert(sizeof(ShaderConstants) == 20u * sizeof(uint32_t));
+static_assert(sizeof(ShaderConstants) == 24u * sizeof(uint32_t));
 
 inline ID3D12Device* device = nullptr;
 inline ID3D12RootSignature* root_signature = nullptr;
@@ -55,6 +60,7 @@ inline void ReleaseTarget(MotionTarget& target) {
 
 inline void ReleaseDescriptorSet(DescriptorSet& set) {
   if (set.heap != nullptr) set.heap->Release();
+  if (set.native_motion != nullptr) set.native_motion->Release();
   if (set.depth != nullptr) set.depth->Release();
   if (set.motion != nullptr) set.motion->Release();
   set = {};
@@ -96,6 +102,25 @@ inline DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT format) {
   }
 }
 
+// Native object motion is read as floating-point values exactly like
+// Streamline's mvec.hlsl. Keep this allow-list conservative; unsupported or
+// typeless encodings fall through rather than being reinterpreted incorrectly.
+inline DXGI_FORMAT MotionSrvFormat(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_SNORM:
+      return format;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
+  }
+}
+
 inline bool SupportsFormat(
     DXGI_FORMAT format,
     D3D12_FORMAT_SUPPORT1 required1,
@@ -113,7 +138,10 @@ inline bool SupportsFormat(
       && (support.Support2 & required2) == required2;
 }
 
-inline bool FrameCompatible(const UniversalFrame& frame, ID3D12Resource* depth) {
+inline bool FrameCompatible(
+    const UniversalFrame& frame,
+    ID3D12Resource* depth,
+    ID3D12Resource* native_motion) {
   if (device == nullptr || root_signature == nullptr || pipeline_state == nullptr
       || descriptor_size == 0u || depth == nullptr) {
     return false;
@@ -129,20 +157,51 @@ inline bool FrameCompatible(const UniversalFrame& frame, ID3D12Resource* depth) 
     return false;
   }
 
-  const auto desc = depth->GetDesc();
-  const auto srv_format = DepthSrvFormat(desc.Format);
-  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-      || desc.DepthOrArraySize != 1u
-      || desc.SampleDesc.Count != 1u
-      || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0
+  const auto depth_desc = depth->GetDesc();
+  const auto depth_srv_format = DepthSrvFormat(depth_desc.Format);
+  if (depth_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+      || depth_desc.DepthOrArraySize != 1u
+      || depth_desc.SampleDesc.Count != 1u
+      || (depth_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0
       || !SupportsFormat(
-          srv_format,
+          depth_srv_format,
           static_cast<D3D12_FORMAT_SUPPORT1>(
               D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD))) {
     return false;
   }
-  return desc.Width >= frame.render_extent.width
-      && desc.Height >= frame.render_extent.height;
+  if (depth_desc.Width < frame.render_extent.width
+      || depth_desc.Height < frame.render_extent.height) {
+    return false;
+  }
+
+  if (native_motion != nullptr) {
+    if (!frame.motion_vectors.IsValid()
+        || frame.motion_vectors.x != 0u
+        || frame.motion_vectors.y != 0u
+        || frame.motion_vectors.extent.width != frame.render_extent.width
+        || frame.motion_vectors.extent.height != frame.render_extent.height
+        || !std::isfinite(frame.motion.scale_x)
+        || !std::isfinite(frame.motion.scale_y)) {
+      return false;
+    }
+
+    const auto native_desc = native_motion->GetDesc();
+    const auto native_srv_format = MotionSrvFormat(native_desc.Format);
+    if (native_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || native_desc.DepthOrArraySize != 1u
+        || native_desc.SampleDesc.Count != 1u
+        || (native_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0
+        || native_desc.Width < frame.render_extent.width
+        || native_desc.Height < frame.render_extent.height
+        || !SupportsFormat(
+            native_srv_format,
+            static_cast<D3D12_FORMAT_SUPPORT1>(
+                D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD))) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 inline bool EnsureTarget(uint32_t viewport, Extent2D extent) {
@@ -205,6 +264,7 @@ inline bool EnsureTarget(uint32_t viewport, Extent2D extent) {
 }
 
 inline DescriptorSet* EnsureDescriptorSet(
+    ID3D12Resource* native_motion,
     ID3D12Resource* depth,
     ID3D12Resource* motion) {
   if (device == nullptr || descriptor_size == 0u || depth == nullptr || motion == nullptr) {
@@ -212,15 +272,24 @@ inline DescriptorSet* EnsureDescriptorSet(
   }
 
   for (auto& set : descriptor_sets) {
-    if (set.depth == depth && set.motion == motion && set.heap != nullptr) return &set;
+    if (set.native_motion == native_motion
+        && set.depth == depth
+        && set.motion == motion
+        && set.heap != nullptr) {
+      return &set;
+    }
   }
 
   const auto depth_format = DepthSrvFormat(depth->GetDesc().Format);
   if (depth_format == DXGI_FORMAT_UNKNOWN) return nullptr;
+  const auto native_format = native_motion == nullptr
+      ? DXGI_FORMAT_R16G16_FLOAT
+      : MotionSrvFormat(native_motion->GetDesc().Format);
+  if (native_format == DXGI_FORMAT_UNKNOWN) return nullptr;
 
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  heap_desc.NumDescriptors = 2u;
+  heap_desc.NumDescriptors = 3u;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   heap_desc.NodeMask = 0u;
 
@@ -230,30 +299,44 @@ inline DescriptorSet* EnsureDescriptorSet(
   }
 
   auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-  srv.Format = depth_format;
-  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  srv.Texture2D.MostDetailedMip = 0u;
-  srv.Texture2D.MipLevels = 1u;
-  srv.Texture2D.PlaneSlice = 0u;
-  srv.Texture2D.ResourceMinLODClamp = 0.0f;
-  device->CreateShaderResourceView(depth, &srv, cpu);
 
+  D3D12_SHADER_RESOURCE_VIEW_DESC native_srv{};
+  native_srv.Format = native_format;
+  native_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  native_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  native_srv.Texture2D.MostDetailedMip = 0u;
+  native_srv.Texture2D.MipLevels = 1u;
+  native_srv.Texture2D.PlaneSlice = 0u;
+  native_srv.Texture2D.ResourceMinLODClamp = 0.0f;
+  device->CreateShaderResourceView(native_motion, &native_srv, cpu);
+
+  cpu.ptr += descriptor_size;
+  D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
+  depth_srv.Format = depth_format;
+  depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  depth_srv.Texture2D.MostDetailedMip = 0u;
+  depth_srv.Texture2D.MipLevels = 1u;
+  depth_srv.Texture2D.PlaneSlice = 0u;
+  depth_srv.Texture2D.ResourceMinLODClamp = 0.0f;
+  device->CreateShaderResourceView(depth, &depth_srv, cpu);
+
+  cpu.ptr += descriptor_size;
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
   uav.Format = DXGI_FORMAT_R16G16_FLOAT;
   uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
   uav.Texture2D.MipSlice = 0u;
   uav.Texture2D.PlaneSlice = 0u;
-  cpu.ptr += descriptor_size;
   device->CreateUnorderedAccessView(motion, nullptr, &uav, cpu);
 
-  // Keep the resources alive as long as the immutable descriptors can be
-  // referenced. This also prevents pointer reuse from aliasing an old cache key.
+  // Keep resources alive as long as immutable descriptors can reference them.
+  // This also prevents pointer reuse from aliasing an old cache key.
+  if (native_motion != nullptr) native_motion->AddRef();
   depth->AddRef();
   motion->AddRef();
   descriptor_sets.push_back(DescriptorSet{
       .heap = heap,
+      .native_motion = native_motion,
       .depth = depth,
       .motion = motion,
   });
@@ -303,7 +386,7 @@ inline void Shutdown() {
 
   D3D12_DESCRIPTOR_RANGE ranges[2]{};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  ranges[0].NumDescriptors = 1u;
+  ranges[0].NumDescriptors = 2u;
   ranges[0].BaseShaderRegister = 0u;
   ranges[0].RegisterSpace = 0u;
   ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -325,7 +408,7 @@ inline void Shutdown() {
   parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   parameters[2].Constants.ShaderRegister = 0u;
   parameters[2].Constants.RegisterSpace = 0u;
-  parameters[2].Constants.Num32BitValues = 20u;
+  parameters[2].Constants.Num32BitValues = 24u;
   parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC root_desc{};
@@ -373,9 +456,9 @@ inline void Shutdown() {
     return false;
   }
 
-  const auto descriptor_size = candidate->GetDescriptorHandleIncrementSize(
+  const auto increment = candidate->GetDescriptorHandleIncrementSize(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-  if (descriptor_size == 0u) {
+  if (increment == 0u) {
     pipeline_state->Release();
     root_signature->Release();
     FreeLibrary(module);
@@ -387,7 +470,7 @@ inline void Shutdown() {
   internal::root_signature = root_signature;
   internal::pipeline_state = pipeline_state;
   internal::d3d12_module = module;
-  internal::descriptor_size = descriptor_size;
+  internal::descriptor_size = increment;
   return true;
 }
 
@@ -401,8 +484,9 @@ inline void Shutdown() {
 [[nodiscard]] inline bool Prepare(
     uint32_t viewport,
     const UniversalFrame& frame,
-    ID3D12Resource* depth) {
-  if (!internal::FrameCompatible(frame, depth)
+    ID3D12Resource* depth,
+    ID3D12Resource* native_motion = nullptr) {
+  if (!internal::FrameCompatible(frame, depth, native_motion)
       || !internal::EnsureTarget(viewport, frame.render_extent)) {
     return false;
   }
@@ -410,20 +494,25 @@ inline void Shutdown() {
   const auto target_it = internal::targets.find(viewport);
   return target_it != internal::targets.end()
       && target_it->second.resource != nullptr
-      && internal::EnsureDescriptorSet(depth, target_it->second.resource) != nullptr;
+      && internal::EnsureDescriptorSet(
+          native_motion, depth, target_it->second.resource) != nullptr;
 }
 
 [[nodiscard]] inline ID3D12Resource* Dispatch(
     ID3D12GraphicsCommandList* command_list,
     uint32_t viewport,
     const UniversalFrame& frame,
-    ID3D12Resource* depth) {
-  if (command_list == nullptr || !Prepare(viewport, frame, depth)) return nullptr;
+    ID3D12Resource* depth,
+    ID3D12Resource* native_motion = nullptr) {
+  if (command_list == nullptr
+      || !Prepare(viewport, frame, depth, native_motion)) {
+    return nullptr;
+  }
 
   const auto target_it = internal::targets.find(viewport);
   if (target_it == internal::targets.end() || target_it->second.resource == nullptr) return nullptr;
   auto* motion = target_it->second.resource;
-  auto* descriptors = internal::EnsureDescriptorSet(depth, motion);
+  auto* descriptors = internal::EnsureDescriptorSet(native_motion, depth, motion);
   if (descriptors == nullptr || descriptors->heap == nullptr) return nullptr;
 
   D3D12_RESOURCE_BARRIER to_uav{};
@@ -441,7 +530,7 @@ inline void Shutdown() {
 
   auto gpu = descriptors->heap->GetGPUDescriptorHandleForHeapStart();
   command_list->SetComputeRootDescriptorTable(0u, gpu);
-  gpu.ptr += internal::descriptor_size;
+  gpu.ptr += 2u * internal::descriptor_size;
   command_list->SetComputeRootDescriptorTable(1u, gpu);
 
   internal::ShaderConstants constants{};
@@ -451,7 +540,10 @@ inline void Shutdown() {
       constants.current_to_previous_clip);
   constants.render_width = frame.render_extent.width;
   constants.render_height = frame.render_extent.height;
-  command_list->SetComputeRoot32BitConstants(2u, 20u, &constants, 0u);
+  constants.native_motion_scale_x = frame.motion.scale_x;
+  constants.native_motion_scale_y = frame.motion.scale_y;
+  constants.use_native_motion = native_motion != nullptr ? 1u : 0u;
+  command_list->SetComputeRoot32BitConstants(2u, 24u, &constants, 0u);
   command_list->Dispatch(
       (frame.render_extent.width + 15u) / 16u,
       (frame.render_extent.height + 15u) / 16u,
