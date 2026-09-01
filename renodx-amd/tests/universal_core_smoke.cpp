@@ -1,6 +1,8 @@
 #include <cassert>
 
 #include "universal/backend.hpp"
+#include "universal/capture.hpp"
+#include "universal/discovery.hpp"
 #include "universal/reconstruction.hpp"
 #include "universal/routing.hpp"
 #include "universal/universal_frame.hpp"
@@ -9,11 +11,13 @@ using namespace renodx::universal;
 
 namespace {
 
+int dummy_resource = 0;
+
 ResourceView MakeResource(ResourceSemantic semantic, float confidence = 1.0f) {
   return ResourceView{
       .resource = ResourceHandle{
           .api = GraphicsApi::kD3D12,
-          .native = reinterpret_cast<void*>(0x1),
+          .native = &dummy_resource,
       },
       .extent = Extent2D{1920u, 1080u},
       .semantic = semantic,
@@ -91,6 +95,26 @@ int main() {
   wrong_api.api = GraphicsApi::kVulkan;
   const auto rejected_api = PlanRoute(wrong_api, backend);
   assert(!rejected_api.eligible);
+
+  ResourceObservation observation{};
+  observation.resource = native.depth.resource;
+  observation.extent = native.depth.extent;
+  observation.usage = kUsageDepthStencil | kUsageShaderRead;
+  observation.frame_write_count = 1u;
+  observation.frame_read_count = 2u;
+
+  SemanticCandidate candidate{};
+  candidate.semantic = ResourceSemantic::kDepth;
+  candidate.observation = observation;
+  candidate.score = 0.9f;
+  candidate.evidence = kEvidenceUsagePattern | kEvidenceExtentMatch;
+  assert(candidate.IsPlausible());
+
+  CaptureContext capture{};
+  capture.api = GraphicsApi::kD3D12;
+  capture.frame_id = 42u;
+  assert(capture.api == GraphicsApi::kD3D12);
+  assert(capture.frame_id == 42u);
 
   return 0;
 }
