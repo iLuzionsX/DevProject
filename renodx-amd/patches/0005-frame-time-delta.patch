@@ -1,0 +1,46 @@
+From: RenoDX AMD bridge experiment
+Subject: [PATCH 5/5] dlss: measure FidelityFX frame delta per viewport
+
+AMD's sample feeds the upscaler the current frame delta in milliseconds. The
+Streamline common constants do not carry a generic frame-time value, so use the
+steady-clock interval between actual AMD upscale evaluations for each viewport.
+The configured 16.67 ms value remains only as the first-frame fallback.
+
+--- a/src/utils/dlss/ffx_upscale_backend_dx12.hpp
++++ b/src/utils/dlss/ffx_upscale_backend_dx12.hpp
+@@
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+@@
+ struct ContextRecord {
+   ffxContext context = nullptr;
+   Dimensions max_render_size{};
+   Dimensions max_upscale_size{};
+   uint32_t create_flags = 0u;
++  std::optional<std::chrono::steady_clock::time_point> last_dispatch_time;
+ };
+@@
+ inline FfxApiResource OutputResource(const CapturedResource& captured) {
+@@
+ }
++
++inline float MeasureFrameTimeDelta(ContextRecord& record) {
++  const auto now = std::chrono::steady_clock::now();
++  float delta_ms = std::max(config.frame_time_delta_ms, 0.001f);
++  if (record.last_dispatch_time.has_value()) {
++    delta_ms = std::chrono::duration<float, std::milli>(
++        now - *record.last_dispatch_time).count();
++    if (!std::isfinite(delta_ms) || delta_ms <= 0.0f) {
++      delta_ms = std::max(config.frame_time_delta_ms, 0.001f);
++    }
++  }
++  record.last_dispatch_time = now;
++  return delta_ms;
++}
+@@
+-  dispatch.frameTimeDelta = std::max(config.frame_time_delta_ms, 0.001f);
++  dispatch.frameTimeDelta = MeasureFrameTimeDelta(record_it->second);
+
+-- 
+2.0.0

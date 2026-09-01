@@ -1,0 +1,78 @@
+From: RenoDX AMD bridge experiment
+Subject: [PATCH 4/4] dlss: honor Streamline resource lifecycle
+
+Streamline explicitly permits eOnlyValidNow resources to change, be destroyed, or
+be reused immediately after the tagging call. Caching those raw resource pointers
+for a later slEvaluateFeature call is invalid even if the COM object remains alive.
+
+Reject eOnlyValidNow resources from persistent/frame tag capture. They are still
+accepted when supplied directly in the slEvaluateFeature structure chain, where
+"now" is the dispatch call itself. After AMD takes ownership, consume exact-frame
+state and clear viewport-global legacy resources so eValidUntilEvaluate or
+ eValidUntilPresent pointers cannot leak into a later frame. Persistent DLSS
+options remain intact.
+
+--- a/src/utils/dlss/amd_bridge.hpp
++++ b/src/utils/dlss/amd_bridge.hpp
+@@
+-inline void ApplyTags(FrameResources& resources, const sl::ResourceTag* tags, uint32_t num_tags) {
++inline void ApplyTags(
++    FrameResources& resources,
++    const sl::ResourceTag* tags,
++    uint32_t num_tags,
++    bool allow_only_valid_now = false) {
+   if (tags == nullptr || num_tags == 0u) return;
+ 
+   for (uint32_t i = 0u; i < num_tags; ++i) {
+     const auto& tag = tags[i];
+     auto* slot = FindResourceSlot(resources, tag.type);
+     if (slot == nullptr) continue;
++
++    // eOnlyValidNow is not safe to retain from slSetTag/slSetTagForFrame. It
++    // can only be consumed when the tag is part of the evaluate call itself.
++    if (tag.lifecycle == sl::eOnlyValidNow && !allow_only_valid_now) {
++      slot->resource.reset();
++      slot->extent.reset();
++      continue;
++    }
+ 
+     if (tag.resource == nullptr || tag.resource->native == nullptr) {
+@@
+       if (current->structType == sl::ResourceTag::s_structType) {
+-        ApplyTags(state.resources, reinterpret_cast<const sl::ResourceTag*>(current), 1u);
++        ApplyTags(
++            state.resources,
++            reinterpret_cast<const sl::ResourceTag*>(current),
++            1u,
++            true);
+@@
+ inline void ResetState() {
+   std::unique_lock lock(internal::state_mutex);
+   internal::states.clear();
+   internal::next_sequence = 1u;
+ }
++
++inline void ConsumeFrameState(uint32_t frame_index, uint32_t viewport) {
++  std::unique_lock lock(internal::state_mutex);
++  internal::states.erase(internal::FrameKey{frame_index, viewport});
++
++  // Deprecated slSetTag is viewport-global, but its resources still carry a
++  // finite lifecycle. After this viewport's upscale evaluate, never allow the
++  // same raw resources to become an implicit fallback for a later frame.
++  const auto legacy = internal::states.find(
++      internal::FrameKey{kLegacyFrameIndex, viewport});
++  if (legacy != internal::states.end()) {
++    legacy->second.state.resources = {};
++  }
++}
+@@
+   const auto evaluate = internal::evaluate_callback.load(std::memory_order_acquire);
+   if (evaluate == nullptr) return false;
+ 
+   *result = evaluate(feature, frame, inputs, num_inputs, command_buffer, *state);
++  ConsumeFrameState(state->frame_index, state->viewport);
+   return true;
+ }
+
+-- 
+2.0.0

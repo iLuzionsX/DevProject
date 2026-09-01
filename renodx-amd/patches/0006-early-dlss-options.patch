@@ -1,0 +1,104 @@
+From: RenoDX AMD bridge experiment
+Subject: [PATCH 6/6] dlss: complete pre-device DLSS options compatibility
+
+If slIsFeatureSupported succeeds from the validated adapter probe, a title may ask
+for DLSS optimal settings before the live game device/context exists. FidelityFX
+publishes fixed quality ratios and its FSR3 provider computes render dimensions by
+dividing display dimensions by that ratio and truncating to uint32_t. Reproduce
+that public contract directly so the compatibility answer does not depend on an
+initialized FFX context.
+
+Also accept/capture slDLSSSetOptions after a positive adapter probe; the options
+are retained by the bridge and applied when the real per-viewport context is
+created after slSetD3DDevice.
+
+--- a/src/utils/dlss/ffx_upscale_backend_dx12.hpp
++++ b/src/utils/dlss/ffx_upscale_backend_dx12.hpp
+@@
+ inline std::optional<uint32_t> QualityMode(sl::DLSSMode mode) {
+@@
+ }
++
++inline std::optional<float> QualityRatio(sl::DLSSMode mode) {
++  switch (mode) {
++    case sl::DLSSMode::eDLAA:
++      return 1.0f;
++    case sl::DLSSMode::eMaxQuality:
++    case sl::DLSSMode::eUltraQuality:
++      return 1.5f;
++    case sl::DLSSMode::eBalanced:
++      return 1.7f;
++    case sl::DLSSMode::eMaxPerformance:
++      return 2.0f;
++    case sl::DLSSMode::eUltraPerformance:
++      return 3.0f;
++    default:
++      return std::nullopt;
++  }
++}
+@@
+ inline sl::Result GetOptimalSettings(
+     const sl::DLSSOptions& options,
+     sl::DLSSOptimalSettings& settings) {
+@@
+-  const auto quality = internal::QualityMode(options.mode);
+-  if (!quality.has_value()) return sl::Result::eErrorInvalidParameter;
+-
+-  std::scoped_lock lock(internal::backend_mutex);
+-  if (!internal::initialized || !ffx::GetRuntime().IsReady()) return sl::Result::eErrorNotInitialized;
+-
+-  uint32_t render_width = 0u;
+-  uint32_t render_height = 0u;
+-  ffxQueryDescUpscaleGetRenderResolutionFromQualityMode query{};
+-  query.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE;
+-  query.displayWidth = options.outputWidth;
+-  query.displayHeight = options.outputHeight;
+-  query.qualityMode = *quality;
+-  query.pOutRenderWidth = &render_width;
+-  query.pOutRenderHeight = &render_height;
+-
+-  const auto result = ffx::GetRuntime().query(nullptr, &query.header);
+-  if (result != FFX_API_RETURN_OK || render_width == 0u || render_height == 0u) {
+-    return internal::MapFfxResult(result);
+-  }
++  const auto ratio = internal::QualityRatio(options.mode);
++  if (!ratio.has_value() || *ratio <= 0.0f) return sl::Result::eErrorInvalidParameter;
++
++  // Matches the public FidelityFX provider implementation: divide by the
++  // per-dimension quality ratio, then truncate to uint32_t.
++  const auto render_width = static_cast<uint32_t>(
++      static_cast<float>(options.outputWidth) / *ratio);
++  const auto render_height = static_cast<uint32_t>(
++      static_cast<float>(options.outputHeight) / *ratio);
++  if (render_width == 0u || render_height == 0u) {
++    return sl::Result::eErrorInvalidParameter;
++  }
+@@
+ }
+
+--- a/src/utils/dlss/streamline_v2.hpp
++++ b/src/utils/dlss/streamline_v2.hpp
+@@
+ extern "C" decltype(&slDLSSSetOptions) Real_slDLSSSetOptions = nullptr;
+ extern "C" sl::Result Hooked_slDLSSSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSOptions& options) {
+   if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
+     return renodx::utils::dlss::amd_bridge::ffx_dx12::SetDlssOptions(viewport, options);
+   }
++  if (renodx::utils::dlss::amd_bridge::ffx_dx12::HasPositiveAdapterProbe()) {
++    renodx::utils::dlss::amd_bridge::CaptureDlssOptions(viewport, options);
++    return sl::Result::eOk;
++  }
+ 
+   if (Real_slDLSSSetOptions == nullptr) return sl::Result::eErrorFeatureNotSupported;
+@@
+ extern "C" sl::Result Hooked_slDLSSGetOptimalSettings(
+     const sl::DLSSOptions& options,
+     sl::DLSSOptimalSettings& settings) {
+-  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++  if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()
++      || renodx::utils::dlss::amd_bridge::ffx_dx12::HasPositiveAdapterProbe()) {
+     return renodx::utils::dlss::amd_bridge::ffx_dx12::GetOptimalSettings(options, settings);
+   }
+
+-- 
+2.0.0

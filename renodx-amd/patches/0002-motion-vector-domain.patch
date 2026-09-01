@@ -1,0 +1,39 @@
+From: RenoDX AMD bridge experiment
+Subject: [PATCH 2/2] dlss: scale Streamline motion vectors in their resource domain
+
+Streamline defines mvecScale as the factor used to normalize the game's raw
+motion vectors. FidelityFX expects the scale that converts the sampled motion
+vectors into screen-space pixel displacement.
+
+When a title provides display-resolution motion vectors, multiplying by render
+resolution is wrong. Use the actual tagged motion-vector resource dimensions;
+this also matches the established Streamline translation used by OptiScaler.
+
+--- a/src/utils/dlss/ffx_upscale_backend_dx12.hpp
++++ b/src/utils/dlss/ffx_upscale_backend_dx12.hpp
+@@
+   const auto& resources = state.resources;
+   const auto& constants = *state.constants;
+   const auto render_size = ResourceDimensions(resources.scaling_input);
+   const auto output_size = ResourceDimensions(resources.scaling_output);
++  const auto motion_vector_size = ResourceDimensions(resources.motion_vectors);
++
++  if (!motion_vector_size.IsValid()) {
++    return sl::Result::eErrorMissingInputParameter;
++  }
+@@
+-  // Streamline mvecScale normalizes the game's raw vectors to [-1,1]. FSR
+-  // expects screen-space pixel vectors, so apply the render dimensions after
+-  // the Streamline normalization scale.
++  // Streamline mvecScale normalizes the game's raw vectors. FidelityFX expects
++  // the scale that converts those sampled values into screen-space pixels.
++  // Use the actual MV resource domain: render-resolution MVs use render size,
++  // while display-resolution MVs use presentation size.
+   dispatch.motionVectorScale = {
+-      constants.mvecScale.x * static_cast<float>(render_size.width),
+-      constants.mvecScale.y * static_cast<float>(render_size.height)};
++      constants.mvecScale.x * static_cast<float>(motion_vector_size.width),
++      constants.mvecScale.y * static_cast<float>(motion_vector_size.height)};
+
+-- 
+2.0.0
