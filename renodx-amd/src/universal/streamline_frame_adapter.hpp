@@ -136,6 +136,11 @@ struct FrameExtents {
 
     frame.motion.units = MotionVectorUnits::kNormalized;
     frame.motion.direction = MotionVectorDirection::kCurrentToPrevious;
+    if (constants.cameraMotionIncluded == sl::Boolean::eTrue) {
+      frame.motion.camera_motion = CameraMotionCoverage::kIncluded;
+    } else if (constants.cameraMotionIncluded == sl::Boolean::eFalse) {
+      frame.motion.camera_motion = CameraMotionCoverage::kMissing;
+    }
     frame.motion.scale_x = constants.mvecScale.x;
     frame.motion.scale_y = constants.mvecScale.y;
     frame.motion.contains_jitter =
