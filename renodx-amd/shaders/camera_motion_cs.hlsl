@@ -1,21 +1,23 @@
-// Camera-only motion reconstruction for frames without native velocity data.
+// Camera-motion reconstruction / completion for Streamline DLSS inputs.
 //
-// This contract intentionally mirrors Streamline's own DLSS camera-motion
-// fallback: use the unjittered current-clip -> previous-clip transform together
-// with the current depth buffer and emit CURRENT -> PREVIOUS motion in
-// render-resolution pixels. No previous-depth history texture is required.
+// This mirrors Streamline's own mvec fallback. When native motion exists but
+// Constants::cameraMotionIncluded is false, preserve valid native object motion
+// and fill zero/invalid pixels from current depth + clipToPrevClip. When native
+// motion is absent, every pixel uses camera reprojection. Output is always
+// CURRENT -> PREVIOUS motion in render-resolution pixels for FidelityFX.
 
-Texture2D<float> CurrentDepth : register(t0);
+Texture2D<float4> NativeMotion : register(t0);
+Texture2D<float> CurrentDepth : register(t1);
 RWTexture2D<float2> OutputMotion : register(u0);
 
 cbuffer CameraMotionConstants : register(b0) {
   // Streamline constants are row-major and clipToPrevClip is explicitly
-  // current clip -> previous clip. The depth resource is required by Streamline
-  // to be compatible with this transform, so keep depth in its native clip
-  // convention rather than guessing/re-linearizing it here.
+  // current clip -> previous clip, with temporal jitter excluded.
   row_major float4x4 CurrentToPreviousClip;
   uint2 RenderSize;
-  uint2 Padding;
+  float2 NativeMotionScale;
+  uint UseNativeMotion;
+  uint3 Padding;
 };
 
 [numthreads(16, 16, 1)]
@@ -24,6 +26,24 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID) {
   if (pixel.x >= RenderSize.x || pixel.y >= RenderSize.y) return;
 
   const float2 renderSize = float2(RenderSize);
+
+  if (UseNativeMotion != 0u) {
+    const float2 nativeVelocity = NativeMotion.Load(int3(pixel, 0)).xy;
+
+    // Match Streamline's mvec.hlsl validity heuristic. Valid native vectors
+    // represent object motion and should win; camera reprojection fills only
+    // the pixels Streamline itself treats as missing/invalid.
+    const bool nativeInvalid =
+        any(nativeVelocity > 1.0f)
+        || any(nativeVelocity < -1.0f)
+        || all(nativeVelocity == 0.0f);
+    if (!nativeInvalid) {
+      OutputMotion[pixel] =
+          -nativeVelocity * NativeMotionScale * renderSize;
+      return;
+    }
+  }
+
   const float2 uvCurrent = (float2(pixel) + 0.5f) / renderSize;
   const float depth = CurrentDepth.Load(int3(pixel, 0));
 
