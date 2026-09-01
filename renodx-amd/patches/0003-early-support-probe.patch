@@ -1,0 +1,45 @@
+From: RenoDX AMD bridge experiment
+Subject: [PATCH 3/3] dlss: validate AMD support before slSetD3DDevice
+
+Some Streamline titles query DLSS support before they call slSetD3DDevice. Waiting
+for the live game device makes those titles hide or reject DLSS too early.
+
+Use the exact DXGI adapter LUID supplied by sl::AdapterInfo. The helper creates a
+short-lived D3D12 device on that adapter and asks the signed FidelityFX loader for
+available upscaler providers with ffxQueryDescGetVersions. Only return support
+when that provider query succeeds; do not spoof every AMD adapter blindly.
+
+--- a/src/utils/dlss/streamline_v2.hpp
++++ b/src/utils/dlss/streamline_v2.hpp
+@@
+ #include "./amd_bridge.hpp"
+ #include "./ffx_upscale_backend_dx12.hpp"
++#include "./ffx_support_probe_dx12.hpp"
+ #include "./DXGIFactoryWrapper.hpp"
+@@
+ static decltype(&slIsFeatureSupported) Real_slIsFeatureSupported = nullptr;
+ static sl::Result Hooked_slIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterInfo) {
+-  if (feature == sl::kFeatureDLSS
+-      && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
+-    return sl::Result::eOk;
++  if (feature == sl::kFeatureDLSS) {
++    if (renodx::utils::dlss::amd_bridge::IsBackendAvailable()
++        || renodx::utils::dlss::amd_bridge::ffx_dx12::ProbeAdapterSupport(adapterInfo)) {
++      return sl::Result::eOk;
++    }
+   }
+   return Real_slIsFeatureSupported(feature, adapterInfo);
+ }
+@@
+ static decltype(&slIsFeatureLoaded) Real_slIsFeatureLoaded = nullptr;
+ static sl::Result Hooked_slIsFeatureLoaded(sl::Feature feature, bool& loaded) {
+   if (feature == sl::kFeatureDLSS
+-      && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++      && (renodx::utils::dlss::amd_bridge::IsBackendAvailable()
++          || renodx::utils::dlss::amd_bridge::ffx_dx12::HasPositiveAdapterProbe())) {
+     loaded = true;
+     return sl::Result::eOk;
+   }
+
+-- 
+2.0.0
