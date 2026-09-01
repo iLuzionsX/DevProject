@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Wire the provider-neutral rendering core into the materialized RenoDX bridge.
 
-This layer is intentionally behavior-preserving for the first milestone: the
-existing FidelityFX DX12 backend still accepts only native Streamline temporal
-inputs. It now performs that eligibility check through UniversalFrame/PlanRoute,
-which creates the seam where reconstructed inputs can be enabled later.
+This layer remains behavior-preserving for the current milestone: the live
+FidelityFX DX12 backend still dispatches only with native Streamline motion
+vectors. Frames without native motion are now allowed to reach UniversalFrame /
+PlanRoute, where reconstructed routes remain disabled until a real GPU motion
+resource can be materialized.
 """
 
 from __future__ import annotations
@@ -32,6 +33,28 @@ def copy_universal_headers(bridge_root: Path, renodx_root: Path) -> None:
         shutil.copy2(header, destination / header.name)
 
 
+def patch_bridge_gate(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    old_gate = (
+        "  [[nodiscard]] bool IsReadyForUpscale() const {\n"
+        "    return resources.HasMinimumUpscaleInputs() && constants.has_value();\n"
+        "  }"
+    )
+    new_gate = (
+        "  [[nodiscard]] bool IsReadyForUpscale() const {\n"
+        "    // Motion may be reconstructed by the universal layer. Keep the outer\n"
+        "    // bridge gate limited to inputs every temporal route needs, then let\n"
+        "    // backend preflight decide whether native/reconstructed motion is usable.\n"
+        "    return resources.depth.IsValid()\n"
+        "        && resources.scaling_input.IsValid()\n"
+        "        && resources.scaling_output.IsValid()\n"
+        "        && constants.has_value();\n"
+        "  }"
+    )
+    text = replace_once(text, old_gate, new_gate, "universal outer bridge gate")
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
 def patch_ffx_backend(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
 
@@ -54,8 +77,8 @@ def patch_ffx_backend(path: Path) -> None:
         "      renodx::universal::GraphicsApiBit(renodx::universal::GraphicsApi::kD3D12);\n"
         "  capabilities.requires_depth = true;\n"
         "  capabilities.requires_motion_vectors = true;\n"
-        "  // Behavior-preserving first step: reconstructed motion becomes eligible\n"
-        "  // only after the reconstruction pipeline can produce actual GPU resources.\n"
+        "  // Reconstructed motion becomes eligible only after the reconstruction\n"
+        "  // pipeline can materialize a real GPU motion-vector resource.\n"
         "  capabilities.accepts_reconstructed_motion = false;\n"
         "  capabilities.supports_auto_exposure = true;\n"
         "  capabilities.supports_reactive_mask = true;\n"
@@ -80,8 +103,7 @@ def patch_ffx_backend(path: Path) -> None:
         "  return CreateContextLocked(state.viewport, render_size, output_size, flags);"
     )
     new_preflight = (
-        "  if (!initialized || device == nullptr || !ffx::GetRuntime().IsReady()) return false;\n"
-        "  if (!RequiredResourcesReady(state)) return false;\n\n"
+        "  if (!initialized || device == nullptr || !ffx::GetRuntime().IsReady()) return false;\n\n"
         "  const auto render_size = ResourceDimensions(state.resources.scaling_input);\n"
         "  const auto output_size = ResourceDimensions(state.resources.scaling_output);\n"
         "  const auto depth_size = ResourceDimensions(state.resources.depth);\n"
@@ -99,6 +121,9 @@ def patch_ffx_backend(path: Path) -> None:
         "      || universal_route.tier != renodx::universal::InputTier::kNativeTemporal) {\n"
         "    return false;\n"
         "  }\n\n"
+        "  // Native-only backend checks intentionally happen after neutral routing.\n"
+        "  // This keeps the missing-MV path reachable without changing dispatch yet.\n"
+        "  if (!RequiredResourcesReady(state)) return false;\n\n"
         "  const auto flags = BuildCreateFlags(state);\n"
         "  return CreateContextLocked(state.viewport, render_size, output_size, flags);"
     )
@@ -122,6 +147,7 @@ def main() -> None:
     renodx_root = args.renodx_root.resolve()
 
     copy_universal_headers(bridge_root, renodx_root)
+    patch_bridge_gate(renodx_root / "src" / "utils" / "dlss" / "amd_bridge.hpp")
     patch_ffx_backend(
         renodx_root / "src" / "utils" / "dlss" / "ffx_upscale_backend_dx12.hpp"
     )
