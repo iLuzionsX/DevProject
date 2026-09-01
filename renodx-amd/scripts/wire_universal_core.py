@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Wire the provider-neutral rendering core into the materialized RenoDX bridge.
 
-Native motion vectors remain the preferred path. When they are absent, the
-neutral router may select camera reconstruction only if the DX12 reconstruction
-executor has successfully loaded its shader and can allocate a compatible
-motion target during preflight.
+Native motion vectors remain preferred when Streamline says they already include
+camera motion. If camera motion is absent, preserve valid native object motion
+and complete the buffer with the DX12 camera-reprojection executor. Frames with
+no native motion can use the same executor in camera-only mode.
 """
 
 from __future__ import annotations
@@ -173,10 +173,21 @@ def patch_ffx_backend(path: Path) -> None:
         "  const auto route = renodx::universal::PlanRoute(\n"
         "      universal_frame, UniversalCapabilities());\n"
         "  if (!route.eligible) return false;\n\n"
-        "  const bool reconstructed_motion =\n"
-        "      route.motion.source == renodx::universal::MotionSource::kCameraReprojection;\n"
+        "  const bool camera_completion = route.motion.source\n"
+        "      == renodx::universal::MotionSource::kNativeWithCameraReprojection;\n"
+        "  const bool reconstructed_motion = camera_completion\n"
+        "      || route.motion.source == renodx::universal::MotionSource::kCameraReprojection;\n"
         "  if (route.motion.source == renodx::universal::MotionSource::kNative) {\n"
         "    if (!RequiredResourcesReady(state)) return false;\n"
+        "  } else if (camera_completion) {\n"
+        "    if (!RequiredResourcesReady(state)\n"
+        "        || !renodx::universal::camera_motion_dx12::Prepare(\n"
+        "            state.viewport,\n"
+        "            universal_frame,\n"
+        "            NativeResource(state.resources.depth),\n"
+        "            NativeResource(state.resources.motion_vectors))) {\n"
+        "      return false;\n"
+        "    }\n"
         "  } else if (reconstructed_motion) {\n"
         "    if (!renodx::universal::camera_motion_dx12::Prepare(\n"
         "            state.viewport, universal_frame, NativeResource(state.resources.depth))) {\n"
@@ -204,10 +215,22 @@ def patch_ffx_backend(path: Path) -> None:
         "  const auto route = renodx::universal::PlanRoute(\n"
         "      universal_frame, UniversalCapabilities());\n"
         "  if (!route.eligible) return sl::Result::eErrorMissingInputParameter;\n"
-        "  const bool reconstructed_motion =\n"
-        "      route.motion.source == renodx::universal::MotionSource::kCameraReprojection;\n"
+        "  const bool camera_completion = route.motion.source\n"
+        "      == renodx::universal::MotionSource::kNativeWithCameraReprojection;\n"
+        "  const bool reconstructed_motion = camera_completion\n"
+        "      || route.motion.source == renodx::universal::MotionSource::kCameraReprojection;\n"
         "  if (route.motion.source == renodx::universal::MotionSource::kNative) {\n"
         "    if (!RequiredResourcesReady(state)) return sl::Result::eErrorMissingInputParameter;\n"
+        "  } else if (camera_completion) {\n"
+        "    if (!RequiredCommonResourcesReady(state)\n"
+        "        || !RequiredResourcesReady(state)\n"
+        "        || !renodx::universal::camera_motion_dx12::Prepare(\n"
+        "            state.viewport,\n"
+        "            universal_frame,\n"
+        "            NativeResource(state.resources.depth),\n"
+        "            NativeResource(state.resources.motion_vectors))) {\n"
+        "      return sl::Result::eErrorMissingInputParameter;\n"
+        "    }\n"
         "  } else if (reconstructed_motion) {\n"
         "    if (!RequiredCommonResourcesReady(state)\n"
         "        || !renodx::universal::camera_motion_dx12::Prepare(\n"
@@ -250,7 +273,7 @@ def patch_ffx_backend(path: Path) -> None:
     text = replace_once(
         text,
         "  TransitionResource(command_list, resources.motion_vectors, kReadState, restore);",
-        "  if (!reconstructed_motion) {\n"
+        "  if (!reconstructed_motion || camera_completion) {\n"
         "    TransitionResource(command_list, resources.motion_vectors, kReadState, restore);\n"
         "  }",
         "conditional native motion transition",
@@ -264,7 +287,8 @@ def patch_ffx_backend(path: Path) -> None:
         "        command_list,\n"
         "        state.viewport,\n"
         "        universal_frame,\n"
-        "        NativeResource(resources.depth));\n"
+        "        NativeResource(resources.depth),\n"
+        "        camera_completion ? NativeResource(resources.motion_vectors) : nullptr);\n"
         "    if (motion_resource == nullptr) {\n"
         "      RestoreResourceStates(command_list, restore);\n"
         "      return sl::Result::eErrorComputeFailed;\n"
@@ -306,7 +330,7 @@ def patch_ffx_backend(path: Path) -> None:
     )
     initialize_new = (
         "  if (device == nullptr || !internal::IsAmdDevice(device) || !ffx::Load(runtime_directory)) return false;\n\n"
-        "  // Failure here is non-fatal: native game motion can still use FidelityFX.\n"
+        "  // Failure here is non-fatal: complete native game motion can still use FidelityFX.\n"
         "  renodx::universal::camera_motion_dx12::Initialize(\n"
         "      device, runtime_directory / L\"camera_motion_cs.dxil\");\n\n"
         "  std::scoped_lock lock(internal::backend_mutex);"
