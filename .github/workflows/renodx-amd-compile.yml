@@ -69,6 +69,11 @@ jobs:
             "bridge/renodx-amd/src/ffx_runtime_loader.hpp",
             "bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp",
             "bridge/renodx-amd/src/ffx_support_probe_dx12.hpp",
+            "bridge/renodx-amd/src/universal/universal_frame.hpp",
+            "bridge/renodx-amd/src/universal/backend.hpp",
+            "bridge/renodx-amd/src/universal/reconstruction.hpp",
+            "bridge/renodx-amd/src/universal/routing.hpp",
+            "bridge/renodx-amd/tests/universal_core_smoke.cpp",
             "bridge/renodx-amd/scripts/materialize_integration.py",
             "bridge/renodx-amd/scripts/harden_streamline_contract.py",
             "fidelityfx/Kits/FidelityFX/api/include/ffx_api.h",
@@ -114,6 +119,17 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: amd64
+
+      - name: Compile universal core smoke test
+        shell: pwsh
+        run: |
+          clang-cl /nologo /std:c++20 /EHsc /W4 /WX `
+            /I bridge/renodx-amd/src `
+            bridge/renodx-amd/tests/universal_core_smoke.cpp `
+            /Fe:universal_core_smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Universal core compile failed" }
+          .\universal_core_smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Universal core smoke test failed" }
 
       - name: Add FidelityFX headers to compiler include path
         shell: pwsh
