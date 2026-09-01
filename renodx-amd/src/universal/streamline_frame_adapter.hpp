@@ -37,6 +37,10 @@ struct FrameExtents {
   view.resource.api = GraphicsApi::kD3D12;
   view.resource.native = captured.resource->native;
   view.extent = ResolveExtent(captured, fallback);
+  if (captured.extent.has_value() && static_cast<bool>(*captured.extent)) {
+    view.x = captured.extent->left;
+    view.y = captured.extent->top;
+  }
   view.provenance = Provenance::kNativeTagged;
   view.confidence = 1.0f;
   return view;
@@ -130,9 +134,6 @@ struct FrameExtents {
     frame.depth_info.near_plane = constants.cameraNear;
     frame.depth_info.far_plane = constants.cameraFar;
 
-    // Streamline's mvecScale converts the stored motion-vector values into its
-    // normalized motion domain. Backends can then convert that domain to their
-    // own pixel/texture convention using the actual MV resource extent.
     frame.motion.units = MotionVectorUnits::kNormalized;
     frame.motion.direction = MotionVectorDirection::kCurrentToPrevious;
     frame.motion.scale_x = constants.mvecScale.x;

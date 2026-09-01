@@ -71,6 +71,7 @@ jobs:
             "bridge/renodx-amd/src/ffx_support_probe_dx12.hpp",
             "bridge/renodx-amd/src/universal/universal_frame.hpp",
             "bridge/renodx-amd/src/universal/backend.hpp",
+            "bridge/renodx-amd/src/universal/camera_motion_dx12.hpp",
             "bridge/renodx-amd/src/universal/capture.hpp",
             "bridge/renodx-amd/src/universal/discovery.hpp",
             "bridge/renodx-amd/src/universal/reconstruction.hpp",
@@ -173,8 +174,9 @@ jobs:
           bridge_sha=${{ github.sha }}
           renodx_sha=$env:RENODX_SHA
           fidelityfx_ref=$env:FFX_REF
-          universal_frame=0
+          universal_frame=1
           camera_motion_shader=cs_6_0
+          camera_motion_runtime=dx12
           "@ | Set-Content -Path hardware-test-manifest.txt -Encoding utf8
 
       - name: Upload hardware-test bundle
