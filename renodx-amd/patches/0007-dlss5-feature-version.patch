@@ -1,0 +1,62 @@
+From: RenoDX AMD bridge experiment
+Subject: [PATCH 7/7] dlss: virtualize DLSS 5 feature requirements and version
+
+DLSS 5 titles may query feature requirements and version information before
+committing to enable DLSS. Virtualize these queries to report DLSS 5.0
+compatibility when the AMD backend is available, allowing DLSS 5 titles to
+accept the FidelityFX-backed path.
+
+This enables:
+- slGetFeatureRequirements returning synthetic DLSS 5.x requirements
+- slGetFeatureVersion reporting version 5.0.0.0
+- Games that check version compatibility accepting the AMD path
+
+The virtualization is gated on IsBackendAvailable() so NVIDIA systems
+continue to see real DLSS information.
+
+--- a/src/utils/dlss/streamline_v2.hpp
++++ b/src/utils/dlss/streamline_v2.hpp
+@@
++static decltype(&slGetFeatureRequirements) Real_slGetFeatureRequirements = nullptr;
++static sl::Result Hooked_slGetFeatureRequirements(
++    sl::Feature feature,
++    sl::FeatureRequirements& requirements) {
++  if (feature == sl::kFeatureDLSS
++      && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    return renodx::utils::dlss::amd_bridge::GetFeatureRequirements(feature, requirements);
++  }
++  
++  if (Real_slGetFeatureRequirements == nullptr) {
++    return sl::Result::eErrorFeatureNotSupported;
++  }
++  return Real_slGetFeatureRequirements(feature, requirements);
++}
++
++static decltype(&slGetFeatureVersion) Real_slGetFeatureVersion = nullptr;
++static sl::Result Hooked_slGetFeatureVersion(
++    sl::Feature feature,
++    sl::FeatureVersion& version) {
++  if (feature == sl::kFeatureDLSS
++      && renodx::utils::dlss::amd_bridge::IsBackendAvailable()) {
++    return renodx::utils::dlss::amd_bridge::GetFeatureVersion(feature, version);
++  }
++  
++  if (Real_slGetFeatureVersion == nullptr) {
++    return sl::Result::eErrorFeatureNotSupported;
++  }
++  return Real_slGetFeatureVersion(feature, version);
++}
+@@
+ static void InitializeStreamlineV2() {
+@@
+   HOOK_STREAMLINE(slIsFeatureSupported);
+   HOOK_STREAMLINE(slIsFeatureLoaded);
+   HOOK_STREAMLINE(slSetConstants);
++  HOOK_STREAMLINE(slGetFeatureRequirements);
++  HOOK_STREAMLINE(slGetFeatureVersion);
+   HOOK_STREAMLINE(slEvaluateFeature);
+   HOOK_STREAMLINE(slShutdown);
+@@
+
+-- 
+2.0.0
