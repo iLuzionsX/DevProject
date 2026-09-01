@@ -7,6 +7,11 @@ on:
     paths:
       - "renodx-amd/**"
       - ".github/workflows/renodx-amd-compile.yml"
+  push:
+    branches: [main]
+    paths:
+      - "renodx-amd/**"
+      - ".github/workflows/renodx-amd-compile.yml"
 
 concurrency:
   group: renodx-amd-${{ github.event.pull_request.number || github.ref }}
@@ -47,6 +52,11 @@ jobs:
           ref: ${{ env.FFX_REF }}
           path: fidelityfx
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Verify pins and source files
         shell: pwsh
         run: |
@@ -59,12 +69,7 @@ jobs:
             "bridge/renodx-amd/src/ffx_runtime_loader.hpp",
             "bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp",
             "bridge/renodx-amd/src/ffx_support_probe_dx12.hpp",
-            "bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
-            "bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
-            "bridge/renodx-amd/patches/0003-early-support-probe.patch",
-            "bridge/renodx-amd/patches/0004-resource-lifecycle.patch",
-            "bridge/renodx-amd/patches/0005-frame-time-delta.patch",
-            "bridge/renodx-amd/patches/0006-early-dlss-options.patch",
+            "bridge/renodx-amd/scripts/materialize_integration.py",
             "fidelityfx/Kits/FidelityFX/api/include/ffx_api.h",
             "fidelityfx/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
             "fidelityfx/Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h"
@@ -73,34 +78,20 @@ jobs:
             if (-not (Test-Path $path)) { throw "Missing required path: $path" }
           }
 
-      - name: Stage bridge into RenoDX worktree
+      - name: Materialize bridge into RenoDX worktree
         shell: pwsh
         run: |
-          Copy-Item bridge/renodx-amd/src/amd_bridge.hpp renodx/src/utils/dlss/amd_bridge.hpp
-          Copy-Item bridge/renodx-amd/src/ffx_runtime_loader.hpp renodx/src/utils/dlss/ffx_runtime_loader.hpp
-          Copy-Item bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp renodx/src/utils/dlss/ffx_upscale_backend_dx12.hpp
-          Copy-Item bridge/renodx-amd/src/ffx_support_probe_dx12.hpp renodx/src/utils/dlss/ffx_support_probe_dx12.hpp
-
-          $patches = @(
-            "../bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
-            "../bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
-            "../bridge/renodx-amd/patches/0003-early-support-probe.patch",
-            "../bridge/renodx-amd/patches/0004-resource-lifecycle.patch",
-            "../bridge/renodx-amd/patches/0005-frame-time-delta.patch",
-            "../bridge/renodx-amd/patches/0006-early-dlss-options.patch"
-          )
-          foreach ($patch in $patches) {
-            git -C renodx apply --check $patch
-            if ($LASTEXITCODE -ne 0) { throw "Patch check failed: $patch" }
-            git -C renodx apply $patch
-            if ($LASTEXITCODE -ne 0) { throw "Patch apply failed: $patch" }
-          }
+          python bridge/renodx-amd/scripts/materialize_integration.py `
+            --bridge-root bridge/renodx-amd `
+            --renodx-root renodx
+          if ($LASTEXITCODE -ne 0) { throw "Bridge materialization failed" }
 
           git -C renodx diff --check
           if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
           git -C renodx status --short
 
       - name: Set up sccache
+        id: sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Set up shader tools
@@ -144,5 +135,5 @@ jobs:
         run: git -C renodx diff --stat
 
       - name: Show sccache stats
-        if: always()
+        if: always() && steps.sccache.outcome == 'success'
         run: sccache --show-stats
