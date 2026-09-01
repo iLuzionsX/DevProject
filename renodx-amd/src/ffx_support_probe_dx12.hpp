@@ -23,6 +23,11 @@
 #include <dxgi1_6.h>
 #include <sl.h>
 
+#if defined(_MSC_VER)
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
+#endif
+
 #if __has_include(<ffx_api.h>) && __has_include(<ffx_upscale.h>)
 #include <ffx_api.h>
 #include <ffx_upscale.h>
