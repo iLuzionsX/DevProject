@@ -58,6 +58,7 @@ jobs:
             "bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
             "bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
             "bridge/renodx-amd/patches/0003-early-support-probe.patch",
+            "bridge/renodx-amd/patches/0004-resource-lifecycle.patch",
             "fidelityfx/Kits/FidelityFX/api/include/ffx_api.h",
             "fidelityfx/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
             "fidelityfx/Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h"
@@ -77,7 +78,8 @@ jobs:
           $patches = @(
             "../bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
             "../bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
-            "../bridge/renodx-amd/patches/0003-early-support-probe.patch"
+            "../bridge/renodx-amd/patches/0003-early-support-probe.patch",
+            "../bridge/renodx-amd/patches/0004-resource-lifecycle.patch"
           )
           foreach ($patch in $patches) {
             git -C renodx apply --check $patch
