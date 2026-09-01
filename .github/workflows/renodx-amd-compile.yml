@@ -79,6 +79,7 @@ jobs:
             "bridge/renodx-amd/src/universal/streamline_frame_adapter.hpp",
             "bridge/renodx-amd/shaders/camera_motion_cs.hlsl",
             "bridge/renodx-amd/tests/universal_core_smoke.cpp",
+            "bridge/renodx-amd/tests/camera_motion_dx12_smoke.cpp",
             "bridge/renodx-amd/scripts/materialize_integration.py",
             "bridge/renodx-amd/scripts/harden_streamline_contract.py",
             "bridge/renodx-amd/scripts/wire_universal_core.py",
@@ -152,6 +153,18 @@ jobs:
           .\universal_core_smoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Universal core smoke test failed" }
 
+      - name: Execute camera-motion shader on D3D12 WARP
+        shell: pwsh
+        run: |
+          clang-cl /nologo /std:c++20 /EHsc /W4 /WX `
+            /I bridge/renodx-amd/src `
+            bridge/renodx-amd/tests/camera_motion_dx12_smoke.cpp `
+            /Fe:camera_motion_dx12_smoke.exe `
+            /link d3d12.lib dxgi.lib
+          if ($LASTEXITCODE -ne 0) { throw "Camera-motion WARP smoke compile failed" }
+          .\camera_motion_dx12_smoke.exe .\camera_motion_cs.dxil
+          if ($LASTEXITCODE -ne 0) { throw "Camera-motion WARP smoke test failed" }
+
       - name: Add FidelityFX headers to compiler include path
         shell: pwsh
         run: |
@@ -177,6 +190,8 @@ jobs:
           universal_frame=1
           camera_motion_shader=cs_6_0
           camera_motion_runtime=dx12
+          camera_motion_warp_smoke=1
+          camera_motion_descriptors=immutable
           "@ | Set-Content -Path hardware-test-manifest.txt -Encoding utf8
 
       - name: Upload hardware-test bundle
