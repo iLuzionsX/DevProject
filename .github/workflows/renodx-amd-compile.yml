@@ -122,7 +122,9 @@ jobs:
       - name: Compile camera-motion reconstruction shader
         shell: pwsh
         run: |
-          dxc -T cs_6_0 -E main -WX `
+          $dxc = Join-Path $env:GITHUB_WORKSPACE "renodx/bin/dxc.exe"
+          if (-not (Test-Path $dxc)) { throw "DXC not found at $dxc" }
+          & $dxc -T cs_6_0 -E main -WX `
             -Fo camera_motion_cs.dxil `
             bridge/renodx-amd/shaders/camera_motion_cs.hlsl
           if ($LASTEXITCODE -ne 0) { throw "Camera motion shader compile failed" }
