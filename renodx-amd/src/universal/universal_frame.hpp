@@ -46,6 +46,12 @@ enum class MotionVectorDirection : uint8_t {
   kPreviousToCurrent,
 };
 
+enum class CameraMotionCoverage : uint8_t {
+  kUnknown = 0,
+  kIncluded,
+  kMissing,
+};
+
 enum class DepthConvention : uint8_t {
   kUnknown = 0,
   kZeroToOne,
@@ -98,6 +104,7 @@ struct ResourceView {
 struct MotionMetadata {
   MotionVectorUnits units = MotionVectorUnits::kUnknown;
   MotionVectorDirection direction = MotionVectorDirection::kUnknown;
+  CameraMotionCoverage camera_motion = CameraMotionCoverage::kUnknown;
   float scale_x = 1.0f;
   float scale_y = 1.0f;
   bool contains_jitter = false;
