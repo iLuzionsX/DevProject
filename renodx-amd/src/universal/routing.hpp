@@ -10,6 +10,7 @@ namespace renodx::universal {
 enum class InputTier : uint8_t {
   kInsufficient = 0,
   kNativeTemporal,
+  kNativeCameraCompletion,
   kCameraReconstructible,
   kOpticalFlowFallback,
   kHybridReconstruction,
@@ -45,6 +46,9 @@ struct RouteDecision {
   switch (decision.motion.source) {
     case MotionSource::kNative:
       decision.tier = InputTier::kNativeTemporal;
+      break;
+    case MotionSource::kNativeWithCameraReprojection:
+      decision.tier = InputTier::kNativeCameraCompletion;
       break;
     case MotionSource::kCameraReprojection:
       decision.tier = InputTier::kCameraReconstructible;
