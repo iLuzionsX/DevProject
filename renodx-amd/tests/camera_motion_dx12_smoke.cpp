@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -38,14 +39,11 @@ D3D12_HEAP_PROPERTIES HeapProperties(D3D12_HEAP_TYPE type) {
   return properties;
 }
 
-D3D12_RESOURCE_DESC Texture2DDesc(
-    DXGI_FORMAT format,
-    uint32_t width,
-    uint32_t height) {
+D3D12_RESOURCE_DESC Texture2DDesc(DXGI_FORMAT format) {
   D3D12_RESOURCE_DESC desc{};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = width;
-  desc.Height = height;
+  desc.Width = kWidth;
+  desc.Height = kHeight;
   desc.DepthOrArraySize = 1u;
   desc.MipLevels = 1u;
   desc.Format = format;
@@ -67,6 +65,104 @@ D3D12_RESOURCE_DESC BufferDesc(uint64_t size) {
   desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   desc.Flags = D3D12_RESOURCE_FLAG_NONE;
   return desc;
+}
+
+struct UploadedTexture {
+  ComPtr<ID3D12Resource> texture;
+  ComPtr<ID3D12Resource> upload;
+};
+
+bool CreateUploadedTexture(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* command_list,
+    DXGI_FORMAT format,
+    const void* pixel_value,
+    uint32_t pixel_size,
+    UploadedTexture& output) {
+  if (device == nullptr || command_list == nullptr || pixel_value == nullptr || pixel_size == 0u) {
+    return false;
+  }
+
+  const auto desc = Texture2DDesc(format);
+  const auto default_heap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+  if (!Check(
+          device->CreateCommittedResource(
+              &default_heap,
+              D3D12_HEAP_FLAG_NONE,
+              &desc,
+              D3D12_RESOURCE_STATE_COPY_DEST,
+              nullptr,
+              IID_PPV_ARGS(output.texture.GetAddressOf())),
+          "Create uploaded texture")) {
+    return false;
+  }
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  UINT rows = 0u;
+  UINT64 row_size = 0u;
+  UINT64 upload_size = 0u;
+  device->GetCopyableFootprints(
+      &desc,
+      0u,
+      1u,
+      0u,
+      &footprint,
+      &rows,
+      &row_size,
+      &upload_size);
+  if (rows != kHeight || row_size < static_cast<UINT64>(kWidth) * pixel_size) {
+    std::cerr << "Unexpected upload footprint\n";
+    return false;
+  }
+
+  const auto upload_heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+  const auto upload_desc = BufferDesc(upload_size);
+  if (!Check(
+          device->CreateCommittedResource(
+              &upload_heap,
+              D3D12_HEAP_FLAG_NONE,
+              &upload_desc,
+              D3D12_RESOURCE_STATE_GENERIC_READ,
+              nullptr,
+              IID_PPV_ARGS(output.upload.GetAddressOf())),
+          "Create upload buffer")) {
+    return false;
+  }
+
+  uint8_t* mapped = nullptr;
+  const D3D12_RANGE no_read{0u, 0u};
+  if (!Check(
+          output.upload->Map(0u, &no_read, reinterpret_cast<void**>(&mapped)),
+          "Map upload buffer")) {
+    return false;
+  }
+  for (uint32_t y = 0u; y < kHeight; ++y) {
+    uint8_t* row = mapped + footprint.Offset
+        + static_cast<size_t>(y) * footprint.Footprint.RowPitch;
+    for (uint32_t x = 0u; x < kWidth; ++x) {
+      std::memcpy(row + static_cast<size_t>(x) * pixel_size, pixel_value, pixel_size);
+    }
+  }
+  output.upload->Unmap(0u, nullptr);
+
+  D3D12_TEXTURE_COPY_LOCATION destination{};
+  destination.pResource = output.texture.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  destination.SubresourceIndex = 0u;
+  D3D12_TEXTURE_COPY_LOCATION source{};
+  source.pResource = output.upload.Get();
+  source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source.PlacedFootprint = footprint;
+  command_list->CopyTextureRegion(&destination, 0u, 0u, 0u, &source, nullptr);
+
+  D3D12_RESOURCE_BARRIER to_read{};
+  to_read.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  to_read.Transition.pResource = output.texture.Get();
+  to_read.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  to_read.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  to_read.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  command_list->ResourceBarrier(1u, &to_read);
+  return true;
 }
 
 bool ExecuteAndWait(
@@ -117,24 +213,98 @@ void SetIdentity(std::array<float, 16>& matrix) {
   matrix[15] = 1.0f;
 }
 
+struct MotionReadback {
+  ComPtr<ID3D12Resource> resource;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+};
+
+bool CreateMotionReadback(
+    ID3D12Device* device,
+    ID3D12Resource* motion,
+    MotionReadback& output) {
+  const auto desc = motion->GetDesc();
+  UINT rows = 0u;
+  UINT64 row_size = 0u;
+  UINT64 readback_size = 0u;
+  device->GetCopyableFootprints(
+      &desc,
+      0u,
+      1u,
+      0u,
+      &output.footprint,
+      &rows,
+      &row_size,
+      &readback_size);
+  if (rows != kHeight || row_size < static_cast<UINT64>(kWidth) * 4u) {
+    std::cerr << "Unexpected motion footprint\n";
+    return false;
+  }
+
+  const auto readback_heap = HeapProperties(D3D12_HEAP_TYPE_READBACK);
+  const auto readback_desc = BufferDesc(readback_size);
+  return Check(
+      device->CreateCommittedResource(
+          &readback_heap,
+          D3D12_HEAP_FLAG_NONE,
+          &readback_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST,
+          nullptr,
+          IID_PPV_ARGS(output.resource.GetAddressOf())),
+      "Create motion readback");
+}
+
+void RecordMotionReadback(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* motion,
+    const MotionReadback& readback) {
+  D3D12_RESOURCE_BARRIER to_copy{};
+  to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  to_copy.Transition.pResource = motion;
+  to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  command_list->ResourceBarrier(1u, &to_copy);
+
+  D3D12_TEXTURE_COPY_LOCATION source{};
+  source.pResource = motion;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source.SubresourceIndex = 0u;
+  D3D12_TEXTURE_COPY_LOCATION destination{};
+  destination.pResource = readback.resource.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = readback.footprint;
+  command_list->CopyTextureRegion(&destination, 0u, 0u, 0u, &source, nullptr);
+
+  std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+  command_list->ResourceBarrier(1u, &to_copy);
+}
+
 bool ReadFirstMotion(
-    ID3D12Resource* readback,
-    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
+    const MotionReadback& readback,
     uint16_t& x,
     uint16_t& y) {
   const D3D12_RANGE range{
-      static_cast<SIZE_T>(footprint.Offset),
-      static_cast<SIZE_T>(footprint.Offset + 4u),
+      static_cast<SIZE_T>(readback.footprint.Offset),
+      static_cast<SIZE_T>(readback.footprint.Offset + 4u),
   };
   uint8_t* mapped = nullptr;
-  if (!Check(readback->Map(0u, &range, reinterpret_cast<void**>(&mapped)), "Map readback")) {
+  if (!Check(
+          readback.resource->Map(0u, &range, reinterpret_cast<void**>(&mapped)),
+          "Map motion readback")) {
     return false;
   }
-  std::memcpy(&x, mapped + footprint.Offset, sizeof(x));
-  std::memcpy(&y, mapped + footprint.Offset + sizeof(x), sizeof(y));
+  std::memcpy(&x, mapped + readback.footprint.Offset, sizeof(x));
+  std::memcpy(&y, mapped + readback.footprint.Offset + sizeof(x), sizeof(y));
   const D3D12_RANGE written{0u, 0u};
-  readback->Unmap(0u, &written);
+  readback.resource->Unmap(0u, &written);
   return true;
+}
+
+bool ResetCommands(
+    ID3D12CommandAllocator* allocator,
+    ID3D12GraphicsCommandList* command_list) {
+  return Check(allocator->Reset(), "Reset command allocator")
+      && Check(command_list->Reset(allocator, nullptr), "Reset command list");
 }
 
 }  // namespace
@@ -168,7 +338,9 @@ int main(int argc, char** argv) {
   D3D12_COMMAND_QUEUE_DESC queue_desc{};
   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   ComPtr<ID3D12CommandQueue> queue;
-  if (!Check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(queue.GetAddressOf())), "Create command queue")) {
+  if (!Check(
+          device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(queue.GetAddressOf())),
+          "Create command queue")) {
     return 1;
   }
 
@@ -194,7 +366,9 @@ int main(int argc, char** argv) {
   }
 
   ComPtr<ID3D12Fence> fence;
-  if (!Check(device->CreateFence(0u, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf())), "Create fence")) {
+  if (!Check(
+          device->CreateFence(0u, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf())),
+          "Create fence")) {
     return 1;
   }
   const HANDLE fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -203,87 +377,33 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const auto depth_desc = Texture2DDesc(DXGI_FORMAT_R32_FLOAT, kWidth, kHeight);
-  const auto default_heap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
-  ComPtr<ID3D12Resource> depth;
-  if (!Check(
-          device->CreateCommittedResource(
-              &default_heap,
-              D3D12_HEAP_FLAG_NONE,
-              &depth_desc,
-              D3D12_RESOURCE_STATE_COPY_DEST,
-              nullptr,
-              IID_PPV_ARGS(depth.GetAddressOf())),
-          "Create depth texture")) {
+  const float depth_value = 0.5f;
+  UploadedTexture depth{};
+  if (!CreateUploadedTexture(
+          device.Get(),
+          command_list.Get(),
+          DXGI_FORMAT_R32_FLOAT,
+          &depth_value,
+          sizeof(depth_value),
+          depth)) {
     CloseHandle(fence_event);
     return 1;
   }
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_footprint{};
-  UINT depth_rows = 0u;
-  UINT64 depth_row_size = 0u;
-  UINT64 depth_upload_size = 0u;
-  device->GetCopyableFootprints(
-      &depth_desc,
-      0u,
-      1u,
-      0u,
-      &depth_footprint,
-      &depth_rows,
-      &depth_row_size,
-      &depth_upload_size);
-  if (depth_rows != kHeight || depth_row_size < kWidth * sizeof(float)) {
-    std::cerr << "Unexpected depth footprint\n";
+  // Half-float {0.125, 0}. With mvecScale.x = -1 and a 16 px render width,
+  // Streamline's native-preservation branch should output exactly +2 px.
+  const std::array<uint16_t, 2> native_value{0x3000u, 0x0000u};
+  UploadedTexture native_motion{};
+  if (!CreateUploadedTexture(
+          device.Get(),
+          command_list.Get(),
+          DXGI_FORMAT_R16G16_FLOAT,
+          native_value.data(),
+          static_cast<uint32_t>(sizeof(native_value)),
+          native_motion)) {
     CloseHandle(fence_event);
     return 1;
   }
-
-  const auto upload_heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
-  const auto upload_desc = BufferDesc(depth_upload_size);
-  ComPtr<ID3D12Resource> upload;
-  if (!Check(
-          device->CreateCommittedResource(
-              &upload_heap,
-              D3D12_HEAP_FLAG_NONE,
-              &upload_desc,
-              D3D12_RESOURCE_STATE_GENERIC_READ,
-              nullptr,
-              IID_PPV_ARGS(upload.GetAddressOf())),
-          "Create depth upload")) {
-    CloseHandle(fence_event);
-    return 1;
-  }
-
-  uint8_t* upload_data = nullptr;
-  const D3D12_RANGE no_read{0u, 0u};
-  if (!Check(upload->Map(0u, &no_read, reinterpret_cast<void**>(&upload_data)), "Map depth upload")) {
-    CloseHandle(fence_event);
-    return 1;
-  }
-  for (uint32_t y = 0u; y < kHeight; ++y) {
-    auto* row = reinterpret_cast<float*>(upload_data + depth_footprint.Offset
-        + static_cast<size_t>(y) * depth_footprint.Footprint.RowPitch);
-    for (uint32_t x = 0u; x < kWidth; ++x) row[x] = 0.5f;
-  }
-  upload->Unmap(0u, nullptr);
-
-  D3D12_TEXTURE_COPY_LOCATION depth_dst{};
-  depth_dst.pResource = depth.Get();
-  depth_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  depth_dst.SubresourceIndex = 0u;
-  D3D12_TEXTURE_COPY_LOCATION depth_src{};
-  depth_src.pResource = upload.Get();
-  depth_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  depth_src.PlacedFootprint = depth_footprint;
-  command_list->CopyTextureRegion(&depth_dst, 0u, 0u, 0u, &depth_src, nullptr);
-
-  D3D12_RESOURCE_BARRIER depth_to_read{};
-  depth_to_read.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  depth_to_read.Transition.pResource = depth.Get();
-  depth_to_read.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  depth_to_read.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-  depth_to_read.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-  command_list->ResourceBarrier(1u, &depth_to_read);
 
   if (!camera_motion_dx12::Initialize(device.Get(), std::filesystem::path(argv[1]))) {
     std::cerr << "Camera-motion executor initialization failed\n";
@@ -291,13 +411,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto frame = MakeFrame(depth.Get());
+  auto frame = MakeFrame(depth.texture.Get());
   SetIdentity(frame.camera.clip_to_previous_clip);
   auto* motion = camera_motion_dx12::Dispatch(
       command_list.Get(),
       0u,
       frame,
-      depth.Get());
+      depth.texture.Get());
   if (motion == nullptr) {
     std::cerr << "Identity camera-motion dispatch failed\n";
     camera_motion_dx12::Shutdown();
@@ -305,64 +425,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const auto motion_desc = motion->GetDesc();
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT motion_footprint{};
-  UINT motion_rows = 0u;
-  UINT64 motion_row_size = 0u;
-  UINT64 readback_size = 0u;
-  device->GetCopyableFootprints(
-      &motion_desc,
-      0u,
-      1u,
-      0u,
-      &motion_footprint,
-      &motion_rows,
-      &motion_row_size,
-      &readback_size);
-  if (motion_rows != kHeight || motion_row_size < kWidth * 4u) {
-    std::cerr << "Unexpected motion footprint\n";
+  MotionReadback readback{};
+  if (!CreateMotionReadback(device.Get(), motion, readback)) {
     camera_motion_dx12::Shutdown();
     CloseHandle(fence_event);
     return 1;
   }
-
-  const auto readback_heap = HeapProperties(D3D12_HEAP_TYPE_READBACK);
-  const auto readback_desc = BufferDesc(readback_size);
-  ComPtr<ID3D12Resource> readback;
-  if (!Check(
-          device->CreateCommittedResource(
-              &readback_heap,
-              D3D12_HEAP_FLAG_NONE,
-              &readback_desc,
-              D3D12_RESOURCE_STATE_COPY_DEST,
-              nullptr,
-              IID_PPV_ARGS(readback.GetAddressOf())),
-          "Create motion readback")) {
-    camera_motion_dx12::Shutdown();
-    CloseHandle(fence_event);
-    return 1;
-  }
-
-  D3D12_RESOURCE_BARRIER motion_to_copy{};
-  motion_to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  motion_to_copy.Transition.pResource = motion;
-  motion_to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  motion_to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-  motion_to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-  command_list->ResourceBarrier(1u, &motion_to_copy);
-
-  D3D12_TEXTURE_COPY_LOCATION motion_src{};
-  motion_src.pResource = motion;
-  motion_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  motion_src.SubresourceIndex = 0u;
-  D3D12_TEXTURE_COPY_LOCATION motion_dst{};
-  motion_dst.pResource = readback.Get();
-  motion_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  motion_dst.PlacedFootprint = motion_footprint;
-  command_list->CopyTextureRegion(&motion_dst, 0u, 0u, 0u, &motion_src, nullptr);
-
-  std::swap(motion_to_copy.Transition.StateBefore, motion_to_copy.Transition.StateAfter);
-  command_list->ResourceBarrier(1u, &motion_to_copy);
+  RecordMotionReadback(command_list.Get(), motion, readback);
 
   if (!ExecuteAndWait(queue.Get(), command_list.Get(), fence.Get(), fence_event, 1u)) {
     camera_motion_dx12::Shutdown();
@@ -372,7 +441,7 @@ int main(int argc, char** argv) {
 
   uint16_t motion_x = 0u;
   uint16_t motion_y = 0u;
-  if (!ReadFirstMotion(readback.Get(), motion_footprint, motion_x, motion_y)) {
+  if (!ReadFirstMotion(readback, motion_x, motion_y)) {
     camera_motion_dx12::Shutdown();
     CloseHandle(fence_event);
     return 1;
@@ -385,8 +454,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (!Check(allocator->Reset(), "Reset command allocator")
-      || !Check(command_list->Reset(allocator.Get(), nullptr), "Reset command list")) {
+  if (!ResetCommands(allocator.Get(), command_list.Get())) {
     camera_motion_dx12::Shutdown();
     CloseHandle(fence_event);
     return 1;
@@ -396,22 +464,15 @@ int main(int argc, char** argv) {
   // previousClip.x = currentClip.x + 0.25 * w. NDC-to-UV halves that
   // displacement, so at 16 px render width the expected motion is +2 px.
   frame.camera.clip_to_previous_clip[3] = 0.25f;
-  motion = camera_motion_dx12::Dispatch(command_list.Get(), 0u, frame, depth.Get());
+  motion = camera_motion_dx12::Dispatch(
+      command_list.Get(), 0u, frame, depth.texture.Get());
   if (motion == nullptr) {
     std::cerr << "Translated camera-motion dispatch failed\n";
     camera_motion_dx12::Shutdown();
     CloseHandle(fence_event);
     return 1;
   }
-
-  motion_to_copy.Transition.pResource = motion;
-  motion_to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-  motion_to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-  command_list->ResourceBarrier(1u, &motion_to_copy);
-  motion_src.pResource = motion;
-  command_list->CopyTextureRegion(&motion_dst, 0u, 0u, 0u, &motion_src, nullptr);
-  std::swap(motion_to_copy.Transition.StateBefore, motion_to_copy.Transition.StateAfter);
-  command_list->ResourceBarrier(1u, &motion_to_copy);
+  RecordMotionReadback(command_list.Get(), motion, readback);
 
   if (!ExecuteAndWait(queue.Get(), command_list.Get(), fence.Get(), fence_event, 2u)) {
     camera_motion_dx12::Shutdown();
@@ -419,13 +480,67 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (!ReadFirstMotion(readback.Get(), motion_footprint, motion_x, motion_y)) {
+  if (!ReadFirstMotion(readback, motion_x, motion_y)) {
     camera_motion_dx12::Shutdown();
     CloseHandle(fence_event);
     return 1;
   }
   if (motion_x != 0x4000u || (motion_y & 0x7fffu) != 0u) {
     std::cerr << "Translated transform expected +2 px (half 0x4000), got: 0x"
+              << std::hex << motion_x << ", 0x" << motion_y << std::dec << '\n';
+    camera_motion_dx12::Shutdown();
+    CloseHandle(fence_event);
+    return 1;
+  }
+
+  if (!ResetCommands(allocator.Get(), command_list.Get())) {
+    camera_motion_dx12::Shutdown();
+    CloseHandle(fence_event);
+    return 1;
+  }
+
+  // Validate Streamline-style completion: the identity camera transform would
+  // produce zero, so +2 px proves the valid native object vector was preserved.
+  SetIdentity(frame.camera.clip_to_previous_clip);
+  frame.motion_vectors.resource = ResourceHandle{
+      .api = GraphicsApi::kD3D12,
+      .native = native_motion.texture.Get(),
+  };
+  frame.motion_vectors.extent = {kWidth, kHeight};
+  frame.motion_vectors.semantic = ResourceSemantic::kMotionVectors;
+  frame.motion_vectors.provenance = Provenance::kNativeTagged;
+  frame.motion_vectors.confidence = 1.0f;
+  frame.motion.camera_motion = CameraMotionCoverage::kMissing;
+  frame.motion.scale_x = -1.0f;
+  frame.motion.scale_y = 1.0f;
+
+  motion = camera_motion_dx12::Dispatch(
+      command_list.Get(),
+      0u,
+      frame,
+      depth.texture.Get(),
+      native_motion.texture.Get());
+  if (motion == nullptr) {
+    std::cerr << "Native camera-completion dispatch failed\n";
+    camera_motion_dx12::Shutdown();
+    CloseHandle(fence_event);
+    return 1;
+  }
+  RecordMotionReadback(command_list.Get(), motion, readback);
+
+  if (!ExecuteAndWait(queue.Get(), command_list.Get(), fence.Get(), fence_event, 3u)) {
+    camera_motion_dx12::Shutdown();
+    CloseHandle(fence_event);
+    return 1;
+  }
+
+  if (!ReadFirstMotion(readback, motion_x, motion_y)) {
+    camera_motion_dx12::Shutdown();
+    CloseHandle(fence_event);
+    return 1;
+  }
+  if (motion_x != 0x4000u || (motion_y & 0x7fffu) != 0u) {
+    std::cerr << "Native completion expected +2 px (half 0x4000), got: 0x"
               << std::hex << motion_x << ", 0x" << motion_y << std::dec << '\n';
     camera_motion_dx12::Shutdown();
     CloseHandle(fence_event);
