@@ -68,12 +68,22 @@ int main() {
   camera.depth.confidence = 0.9f;
   camera.camera.confidence = 0.8f;
   camera.camera.provenance = Provenance::kNativeDiscovered;
+  camera.camera.layout = MatrixLayout::kRowMajor;
+  camera.camera.clip_to_previous_clip[0] = 1.0f;
+  camera.camera.clip_to_previous_clip[5] = 1.0f;
+  camera.camera.clip_to_previous_clip[10] = 1.0f;
+  camera.camera.clip_to_previous_clip[15] = 1.0f;
 
   const auto camera_route = PlanRoute(camera, backend);
   assert(camera_route.eligible);
   assert(camera_route.tier == InputTier::kCameraReconstructible);
   assert(camera_route.motion.needs_camera_reprojection);
   assert(!camera_route.motion.needs_optical_flow);
+
+  UniversalFrame reset_camera = camera;
+  reset_camera.timing.reset = true;
+  const auto reset_route = PlanRoute(reset_camera, backend);
+  assert(!reset_route.eligible);
 
   ReconstructionPolicy with_flow{};
   with_flow.optical_flow_available = true;
@@ -82,6 +92,9 @@ int main() {
   assert(hybrid_route.tier == InputTier::kHybridReconstruction);
   assert(hybrid_route.motion.needs_camera_reprojection);
   assert(hybrid_route.motion.needs_optical_flow);
+
+  const auto reset_hybrid_route = PlanRoute(reset_camera, backend, with_flow);
+  assert(!reset_hybrid_route.eligible);
 
   UniversalFrame color_only{};
   color_only.api = GraphicsApi::kD3D12;

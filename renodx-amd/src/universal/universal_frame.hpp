@@ -115,6 +115,10 @@ struct CameraState {
   std::array<float, 16> view_projection{};
   std::array<float, 16> previous_view_projection{};
   std::array<float, 16> inverse_view_projection{};
+  // Direct current-clip -> previous-clip transform when the capture API
+  // provides it. This is enough for camera-motion reprojection without
+  // reconstructing world-space camera matrices first.
+  std::array<float, 16> clip_to_previous_clip{};
   MatrixLayout layout = MatrixLayout::kUnknown;
   float jitter_x = 0.0f;
   float jitter_y = 0.0f;

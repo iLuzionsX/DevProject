@@ -3,6 +3,8 @@
 #include "../amd_bridge.hpp"
 #include "universal_frame.hpp"
 
+#include <cmath>
+
 namespace renodx::universal::streamline {
 
 using CapturedResource = renodx::utils::dlss::amd_bridge::CapturedResource;
@@ -38,6 +40,27 @@ struct FrameExtents {
   view.provenance = Provenance::kNativeTagged;
   view.confidence = 1.0f;
   return view;
+}
+
+[[nodiscard]] inline bool CopyStreamlineMatrix(
+    const sl::float4x4& source,
+    std::array<float, 16>& destination) noexcept {
+  float magnitude = 0.0f;
+  for (uint32_t row = 0u; row < 4u; ++row) {
+    const float values[4] = {
+        source.row[row].x,
+        source.row[row].y,
+        source.row[row].z,
+        source.row[row].w,
+    };
+    for (uint32_t column = 0u; column < 4u; ++column) {
+      const float value = values[column];
+      if (!std::isfinite(value) || value == sl::INVALID_FLOAT) return false;
+      destination[row * 4u + column] = value;
+      magnitude += std::abs(value);
+    }
+  }
+  return magnitude > 1.0e-6f;
 }
 
 // Converts the already-captured Streamline/DLSS contract into the provider-
@@ -90,6 +113,17 @@ struct FrameExtents {
     frame.camera.jitter_x = constants.jitterOffset.x;
     frame.camera.jitter_y = constants.jitterOffset.y;
     frame.camera.vertical_fov_radians = constants.cameraFOV;
+
+    // Streamline guarantees these matrices are row-major and unjittered. Its
+    // clipToPrevClip transform is the strongest camera-reprojection signal we
+    // can carry into the provider-neutral ABI without guessing world matrices.
+    if (CopyStreamlineMatrix(
+            constants.clipToPrevClip,
+            frame.camera.clip_to_previous_clip)) {
+      frame.camera.layout = MatrixLayout::kRowMajor;
+      frame.camera.confidence = 1.0f;
+      frame.camera.provenance = Provenance::kNativeTagged;
+    }
 
     frame.depth_info.convention = DepthConvention::kZeroToOne;
     frame.depth_info.reversed = constants.depthInverted == sl::Boolean::eTrue;

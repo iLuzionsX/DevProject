@@ -53,7 +53,12 @@ struct MotionPlan {
     };
   }
 
-  const bool camera_usable = frame.depth.IsValid()
+  // Reconstructed motion cannot cross a history discontinuity. Native vectors
+  // remain eligible above because the consumer can still receive the frame's
+  // explicit reset signal while using the game's current resources.
+  const bool history_usable = !frame.timing.reset && !frame.timing.camera_cut;
+  const bool camera_usable = history_usable
+      && frame.depth.IsValid()
       && frame.depth.confidence >= policy.minimum_depth_confidence
       && frame.camera.confidence >= policy.minimum_camera_confidence;
 
@@ -80,7 +85,7 @@ struct MotionPlan {
     };
   }
 
-  if (policy.optical_flow_available && frame.color.IsValid()) {
+  if (history_usable && policy.optical_flow_available && frame.color.IsValid()) {
     return MotionPlan{
         .source = MotionSource::kOpticalFlow,
         .expected_confidence = 0.5f,
