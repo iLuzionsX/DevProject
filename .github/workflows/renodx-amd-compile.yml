@@ -164,6 +164,28 @@ jobs:
         working-directory: renodx
         run: cmake --build --preset clang-x64-release --target dlssfix --verbose
 
+      - name: Create hardware-test manifest
+        shell: pwsh
+        run: |
+          @"
+          bridge_sha=${{ github.sha }}
+          renodx_sha=$env:RENODX_SHA
+          fidelityfx_ref=$env:FFX_REF
+          universal_frame=0
+          camera_motion_shader=cs_6_0
+          "@ | Set-Content -Path hardware-test-manifest.txt -Encoding utf8
+
+      - name: Upload hardware-test bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: renodx-universal-dx12-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            renodx/build/Release/renodx-dlssfix.addon64
+            renodx/build/Release/renodx-dlssfix.pdb
+            camera_motion_cs.dxil
+            hardware-test-manifest.txt
+
       - name: Build RenoDX x64
         working-directory: renodx
         run: cmake --build --preset clang-x64-release --verbose
