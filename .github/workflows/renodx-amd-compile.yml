@@ -8,6 +8,10 @@ on:
       - "renodx-amd/**"
       - ".github/workflows/renodx-amd-compile.yml"
 
+concurrency:
+  group: renodx-amd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
