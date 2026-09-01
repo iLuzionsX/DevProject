@@ -75,10 +75,12 @@ jobs:
             "bridge/renodx-amd/src/universal/discovery.hpp",
             "bridge/renodx-amd/src/universal/reconstruction.hpp",
             "bridge/renodx-amd/src/universal/routing.hpp",
+            "bridge/renodx-amd/src/universal/streamline_frame_adapter.hpp",
             "bridge/renodx-amd/shaders/camera_motion_cs.hlsl",
             "bridge/renodx-amd/tests/universal_core_smoke.cpp",
             "bridge/renodx-amd/scripts/materialize_integration.py",
             "bridge/renodx-amd/scripts/harden_streamline_contract.py",
+            "bridge/renodx-amd/scripts/wire_universal_core.py",
             "fidelityfx/Kits/FidelityFX/api/include/ffx_api.h",
             "fidelityfx/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
             "fidelityfx/Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h"
@@ -94,6 +96,11 @@ jobs:
             --bridge-root bridge/renodx-amd `
             --renodx-root renodx
           if ($LASTEXITCODE -ne 0) { throw "Bridge materialization failed" }
+
+          python bridge/renodx-amd/scripts/wire_universal_core.py `
+            --bridge-root bridge/renodx-amd `
+            --renodx-root renodx
+          if ($LASTEXITCODE -ne 0) { throw "Universal core wiring failed" }
 
           python bridge/renodx-amd/scripts/harden_streamline_contract.py `
             --renodx-root renodx
