@@ -7,11 +7,6 @@ on:
     paths:
       - "renodx-amd/**"
       - ".github/workflows/renodx-amd-compile.yml"
-  push:
-    branches: [experiment/renodx-amd-bridge]
-    paths:
-      - "renodx-amd/**"
-      - ".github/workflows/renodx-amd-compile.yml"
 
 permissions:
   contents: read
@@ -60,6 +55,7 @@ jobs:
             "bridge/renodx-amd/src/ffx_runtime_loader.hpp",
             "bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp",
             "bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
+            "bridge/renodx-amd/patches/0002-motion-vector-domain.patch",
             "fidelityfx/Kits/FidelityFX/api/include/ffx_api.h",
             "fidelityfx/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
             "fidelityfx/Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h"
@@ -75,10 +71,19 @@ jobs:
           Copy-Item bridge/renodx-amd/src/ffx_runtime_loader.hpp renodx/src/utils/dlss/ffx_runtime_loader.hpp
           Copy-Item bridge/renodx-amd/src/ffx_upscale_backend_dx12.hpp renodx/src/utils/dlss/ffx_upscale_backend_dx12.hpp
 
-          git -C renodx apply --check ../bridge/renodx-amd/patches/0001-streamline-amd-backend.patch
-          git -C renodx apply ../bridge/renodx-amd/patches/0001-streamline-amd-backend.patch
+          $patches = @(
+            "../bridge/renodx-amd/patches/0001-streamline-amd-backend.patch",
+            "../bridge/renodx-amd/patches/0002-motion-vector-domain.patch"
+          )
+          foreach ($patch in $patches) {
+            git -C renodx apply --check $patch
+            if ($LASTEXITCODE -ne 0) { throw "Patch check failed: $patch" }
+            git -C renodx apply $patch
+            if ($LASTEXITCODE -ne 0) { throw "Patch apply failed: $patch" }
+          }
 
           git -C renodx diff --check
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
           git -C renodx status --short
 
       - name: Set up sccache
