@@ -72,8 +72,14 @@ struct MotionPlan {
   // Streamline explicitly supports native object motion without camera motion.
   // Preserve those native vectors and fill only missing/invalid pixels from the
   // camera reprojection path rather than discarding object motion wholesale.
+  //
+  // Do not merge a jittered native field with our unjittered camera reprojection:
+  // FidelityFX's jitter-cancellation flag applies to the whole field. Until the
+  // completion pass tracks previous jitter and normalizes native vectors itself,
+  // fall through to camera-only reconstruction for that mixed-domain case.
   if (native_usable
       && frame.motion.camera_motion == CameraMotionCoverage::kMissing
+      && !frame.motion.contains_jitter
       && camera_usable) {
     return MotionPlan{
         .source = MotionSource::kNativeWithCameraReprojection,
