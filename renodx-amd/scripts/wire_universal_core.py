@@ -293,8 +293,8 @@ def patch_ffx_backend(path: Path) -> None:
     )
     routed_scale = (
         "  dispatch.motionVectorScale = reconstructed_motion\n"
-        "      ? ffxFloatCoords2D{1.0f, 1.0f}\n"
-        "      : ffxFloatCoords2D{\n"
+        "      ? FfxApiFloatCoords2D{1.0f, 1.0f}\n"
+        "      : FfxApiFloatCoords2D{\n"
         "          constants.mvecScale.x * static_cast<float>(motion_vector_size.width),\n"
         "          constants.mvecScale.y * static_cast<float>(motion_vector_size.height)};"
     )
