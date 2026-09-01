@@ -7,9 +7,10 @@ for a later slEvaluateFeature call is invalid even if the COM object remains ali
 
 Reject eOnlyValidNow resources from persistent/frame tag capture. They are still
 accepted when supplied directly in the slEvaluateFeature structure chain, where
-"now" is the dispatch call itself. Consume the exact frame state after AMD takes
-ownership so eValidUntilEvaluate inputs cannot accidentally leak into a later
-frame/evaluation.
+"now" is the dispatch call itself. After AMD takes ownership, consume exact-frame
+state and clear viewport-global legacy resources so eValidUntilEvaluate or
+ eValidUntilPresent pointers cannot leak into a later frame. Persistent DLSS
+options remain intact.
 
 --- a/src/utils/dlss/amd_bridge.hpp
 +++ b/src/utils/dlss/amd_bridge.hpp
@@ -54,6 +55,15 @@ frame/evaluation.
 +inline void ConsumeFrameState(uint32_t frame_index, uint32_t viewport) {
 +  std::unique_lock lock(internal::state_mutex);
 +  internal::states.erase(internal::FrameKey{frame_index, viewport});
++
++  // Deprecated slSetTag is viewport-global, but its resources still carry a
++  // finite lifecycle. After this viewport's upscale evaluate, never allow the
++  // same raw resources to become an implicit fallback for a later frame.
++  const auto legacy = internal::states.find(
++      internal::FrameKey{kLegacyFrameIndex, viewport});
++  if (legacy != internal::states.end()) {
++    legacy->second.state.resources = {};
++  }
 +}
 @@
    const auto evaluate = internal::evaluate_callback.load(std::memory_order_acquire);
